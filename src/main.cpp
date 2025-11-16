@@ -26,6 +26,8 @@ static constexpr int32_t clock_center = clock_size / 2;
 static constexpr auto transpalette = 0;
 static float zoom = 1.0f;
 static uint64_t count_ms = 0;
+static float sin_table[60];
+static float cos_table[60];
 
 struct DateInfo {
   int year;
@@ -112,6 +114,15 @@ static void applyPalette(LGFX_Sprite& sprite) {
   for (int i = 0; i < 16; ++i) {
     auto color = palette_entries[i];
     sprite.setPaletteColor(i, color.r, color.g, color.b);
+  }
+}
+
+static void initTrigTable() {
+  constexpr float deg_to_rad = 0.0174532925f;
+  for (int i = 0; i < 60; ++i) {
+    float rad = i * 6.0f * deg_to_rad;
+    sin_table[i] = std::sin(rad);
+    cos_table[i] = -std::cos(rad);
   }
 }
 
@@ -238,9 +249,8 @@ static void update7Seg(int32_t hour, int32_t minute) {
 
 static void drawDot(int pos, int palette) {
   bool major_tick = 0 == (pos % 5);
-  float rad = pos * 6 * -0.0174532925f;
-  float cosy = -std::cos(rad) * (clock_center * 10 / 10.4);
-  float sinx = -std::sin(rad) * (clock_center * 10 / 10.4);
+  float cosy = cos_table[pos] * (clock_center * 10 / 10.4f);
+  float sinx = sin_table[pos] * (clock_center * 10 / 10.4f);
   canvas.fillCircle(clock_center + sinx, clock_center + cosy, major_tick * 3 + 1, palette);
 }
 
@@ -274,7 +284,7 @@ static void drawClock(uint64_t time_ms) {
   int px = canvas.getPivotX();
   int py = canvas.getPivotY();
   
-  needle1.pushRotateZoom(fhour, 1.0f, 0.7f, transpalette);
+  needle1.pushRotateZoom(fhour, 1.0f, 1.0f, transpalette);
   needle3.pushRotateZoom(fmin , 1.0f, 1.0f, transpalette);
   needle2.pushRotateZoom(fsec , 0.7f, 1.0f, transpalette);
 
@@ -334,41 +344,29 @@ static void initSprites() {
   
 
   for (int i = 1; i <= 60; ++i) {
-    float rad = i * 6 * -0.0174532925f;
-    float cosy = -std::cos(rad) * (clock_center * 10 / 10.4);
-    float sinx = -std::sin(rad) * (clock_center * 10 / 10.4);
+    float cosy = cos_table[i % 60] * (clock_center * 10 / 10.4f);
+    float sinx = sin_table[i % 60] * (clock_center * 10 / 10.4f);
     bool major_tick = 0 == (i % 5);
-    //clockbase.fillCircle(clock_center + sinx + 1, clock_center + cosy + 1, major_tick * 3 + 1, 4);
+    
     clockbase.fillCircle(clock_center + sinx, clock_center + cosy, major_tick * 3 + 1, 12);
     if (major_tick && !(i % 15)) {
-      cosy = -std::cos(rad) * (clock_center * 10 / 13);
-      sinx = -std::sin(rad) * (clock_center * 10 / 13);
-      //clockbase.setTextColor(1);
-      //clockbase.drawNumber(i / 5, clock_center + sinx + 1, clock_center + cosy + 4);
+      cosy = cos_table[i % 60] * (clock_center * 10 / 13.0f);
+      sinx = sin_table[i % 60] * (clock_center * 10 / 13.0f);
+      
       clockbase.setTextColor(15);
       clockbase.drawNumber(i / 5, clock_center + sinx, clock_center + cosy + 3);
     }
   }
-  //clockbase.setTextFont(7);
-
-  // solid white hand used for both hour/minute (scaled via pushRotateZoom)
+ 
   
-  needle1.fillRect(1, 5, 5, 90, 15);
-  //needle1.fillTriangle(4, -15, 6, 120, 2, 120, 15);
-  //needle1.fillRect(0, 90, 9, 12, 15);
-  needle1.fillCircle(3, 4, 2, 15);
+  needle1.fillRect(1, 35, 5, 60, 15); //hour hand sprite
+  needle1.fillCircle(3, 35, 2, 15);
 
-  needle3.fillRect(1, 5, 5, 90, 8);
+  needle3.fillRect(1, 5, 5, 90, 8); //minutes hand sprite
   needle3.fillCircle(3, 4, 2, 8);
 
-  needle2.fillScreen(9);
- 
-  //needle2.drawFastVLine(1, 0, 119, 8);
- 
+  needle2.fillScreen(9); //seconds hand sprite
   needle2.fillRect(0, 99, 1, 2, 9);
-  
-  //needle2.fillCircle(0, 0, 5, 8);
-  //needle2.drawCircle(0, 0, 5, 8);
   
   gfx.startWrite();
 }
@@ -385,6 +383,7 @@ void setup() {
 
   start_date = compileDateInfo();
   last_rendered_day = -1;
+  initTrigTable();
   initSprites();
   count_ms = static_cast<uint64_t>(compileTimeSeconds()) * 1000ULL;
   drawClock(count_ms);
