@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <Wire.h>
 #include "LGFX_Hacktor.hpp"
 
 #ifdef min
@@ -38,6 +39,8 @@ struct DateInfo {
 
 static DateInfo start_date;
 static int32_t last_rendered_day = -1;
+static uint8_t battery_percent = 100;
+static uint32_t last_batt_update_ms = 0;
 
 static constexpr const char* WEEKDAY_NAMES[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 static constexpr const char* MONTH_NAMES[12] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
@@ -140,6 +143,23 @@ static void power(uint8_t mode) {
   digitalWrite(TFT_PWR, mode);
 }
 
+static uint16_t readRegister16(uint8_t reg) {
+  Wire.beginTransmission(0x36);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(0x36, (uint8_t)2);
+  uint16_t value = 0;
+  if (Wire.available() >= 2) {
+    value = (Wire.read() << 8) | Wire.read();
+  }
+  return value;
+}
+
+static uint8_t readBatteryPercent() {
+  uint16_t raw = readRegister16(0x04); // SOC register
+  return static_cast<uint8_t>(std::min<uint16_t>(100, raw >> 8));
+}
+
 static uint32_t compileTimeSeconds() {
   const char* t = __TIME__;  // "hh:mm:ss"
   uint32_t hour = (t[0] - '0') * 10 + (t[1] - '0');
@@ -236,6 +256,36 @@ static void updateDateDisplay(const DateInfo& date) {
  
 }
 
+static void drawBatteryIcon(int x, int y, uint8_t percent) {
+  const int icon_width = 20;
+  const int icon_height = 12;
+  clockbase.fillRect(x, y, icon_width, icon_height, 6);
+  clockbase.drawRect(x, y, icon_width - 4, icon_height, 12);
+  clockbase.fillRect(x + icon_width - 4, y + 3, 3, icon_height - 6, 12);
+
+  int level_width = (icon_width - 6) * percent / 100;
+  clockbase.fillRect(x + 2, y + 2, level_width, icon_height - 4, percent > 20 ? 10 : 14);
+}
+
+static void drawBatteryGauge(uint8_t percent) {
+  const int start_x = clock_center + 25;
+  const int start_y = clock_center - 5;
+  drawBatteryIcon(start_x, start_y, percent);
+
+  auto prev_font = clockbase.getFont();
+  auto prev_datum = clockbase.getTextDatum();
+  clockbase.setFont(&lgfx::v1::fonts::Font2);
+  clockbase.setTextDatum(lgfx::top_left);
+  clockbase.setTextColor(12, 6);
+
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%3u%%", percent);
+  clockbase.drawString(buf, start_x + 20, start_y - 2);
+
+  clockbase.setFont(prev_font);
+  clockbase.setTextDatum(prev_datum);
+}
+
 static void update7Seg(int32_t hour, int32_t minute) {
   int x = clockbase.getPivotX() - 69;
   int y = clockbase.getPivotY();
@@ -271,7 +321,13 @@ static void drawClock(uint64_t time_ms) {
    //update7Seg((minute / 60) % 24, minute % 60);
   }
 
+  if (time_ms - last_batt_update_ms > 60000 || time_ms < last_batt_update_ms) {
+    last_batt_update_ms = time_ms;
+    battery_percent = readBatteryPercent();
+  }
+
   clockbase.pushSprite(0, 0);
+  drawBatteryGauge(battery_percent);
   stepsIcon.pushSprite(clock_center - (stepsIcon.width() >> 1), clock_center + 30, transpalette);
 
   drawDot(minute % 60, 14);
@@ -373,6 +429,7 @@ static void initSprites() {
 
 void setup() {
   Serial.begin(115200);
+  Wire.begin();
   backlight(1023);
   power(HIGH);
 
@@ -385,6 +442,7 @@ void setup() {
   last_rendered_day = -1;
   initTrigTable();
   initSprites();
+  battery_percent = readBatteryPercent();
   count_ms = static_cast<uint64_t>(compileTimeSeconds()) * 1000ULL;
   drawClock(count_ms);
 }
@@ -401,3 +459,4 @@ void loop() {
 
   drawClock(count_ms);
 }
+#include <Wire.h>
