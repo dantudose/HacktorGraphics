@@ -6,6 +6,8 @@
 #include <Wire.h>
 #include "LGFX_Hacktor.hpp"
 
+#define PIN_CHG 21
+
 #ifdef min
 #undef min
 #endif
@@ -41,6 +43,7 @@ static DateInfo start_date;
 static int32_t last_rendered_day = -1;
 static uint8_t battery_percent = 100;
 static uint32_t last_batt_update_ms = 0;
+static bool is_charging = false;
 
 static constexpr const char* WEEKDAY_NAMES[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 static constexpr const char* MONTH_NAMES[12] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
@@ -256,7 +259,7 @@ static void updateDateDisplay(const DateInfo& date) {
  
 }
 
-static void drawBatteryIcon(int x, int y, uint8_t percent) {
+static void drawBatteryIcon(int x, int y, uint8_t percent, bool charging) {
   const int icon_width = 20;
   const int icon_height = 12;
   clockbase.fillRect(x, y, icon_width, icon_height, 6);
@@ -265,12 +268,17 @@ static void drawBatteryIcon(int x, int y, uint8_t percent) {
 
   int level_width = (icon_width - 6) * percent / 100;
   clockbase.fillRect(x + 2, y + 2, level_width, icon_height - 4, percent > 20 ? 10 : 14);
+
+  if (charging) {
+    clockbase.fillTriangle(x + 7, y + 2, x + 11, y + 2, x + 8, y + 7, 15);
+    clockbase.fillTriangle(x + 8, y + 5, x + 12, y + 5, x + 9, y + 10, 15);
+  }
 }
 
-static void drawBatteryGauge(uint8_t percent) {
+static void drawBatteryGauge(uint8_t percent, bool charging) {
   const int start_x = clock_center + 25;
   const int start_y = clock_center - 5;
-  drawBatteryIcon(start_x, start_y, percent);
+  drawBatteryIcon(start_x, start_y, percent, charging);
 
   auto prev_font = clockbase.getFont();
   auto prev_datum = clockbase.getTextDatum();
@@ -325,9 +333,9 @@ static void drawClock(uint64_t time_ms) {
     last_batt_update_ms = time_ms;
     battery_percent = readBatteryPercent();
   }
-
+  bool charging = digitalRead(PIN_CHG) == LOW;
   clockbase.pushSprite(0, 0);
-  drawBatteryGauge(battery_percent);
+  drawBatteryGauge(battery_percent, charging);
   stepsIcon.pushSprite(clock_center - (stepsIcon.width() >> 1), clock_center + 30, transpalette);
 
   drawDot(minute % 60, 14);
@@ -430,6 +438,7 @@ static void initSprites() {
 void setup() {
   Serial.begin(115200);
   Wire.begin();
+  pinMode(PIN_CHG, INPUT_PULLUP);
   backlight(1023);
   power(HIGH);
 
@@ -459,4 +468,3 @@ void loop() {
 
   drawClock(count_ms);
 }
-#include <Wire.h>
