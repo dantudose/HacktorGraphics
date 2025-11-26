@@ -4,10 +4,13 @@
 #include <cstdio>
 #include <cstring>
 #include <Wire.h>
+#include <Preferences.h>
+#include <esp_attr.h>
 #include <NimBLEDevice.h>
 #include "LGFX_Hacktor.hpp"
 
 #define PIN_CHG 21
+#define PIN_BTN 0
 
 #ifdef min
 #undef min
@@ -58,6 +61,9 @@ static constexpr int STEP_BOX_WIDTH = 120;
 static constexpr int STEP_BOX_HEIGHT = 40;
 static constexpr int STEP_BOX_X = clock_center - (STEP_BOX_WIDTH / 2);
 static constexpr int STEP_BOX_Y = clock_center + 50 - (STEP_BOX_HEIGHT / 2);
+static bool info_mode = false;
+static bool info_dirty = true;
+static uint32_t last_info_render_ms = 0;
 
 // BLE CTS (Current Time Service)
 static constexpr uint32_t CTS_SYNC_INTERVAL_MS = 3600000; // hourly
@@ -68,12 +74,18 @@ static bool ble_initialized = false;
 static bool cts_sync_in_progress = false;
 static uint32_t last_cts_sync_ms = 0;
 static uint32_t last_cts_attempt_ms = 0;
+static bool button_state = true;
+static uint32_t last_button_ms = 0;
+static constexpr uint32_t BUTTON_DEBOUNCE_MS = 80;
+static Preferences prefs;
+static uint32_t reset_counter = 0;
 
 static bool imuWriteRegister(uint8_t reg, uint8_t value);
 static bool imuReadRegister(uint8_t reg, uint8_t& value);
 
 static bool syncTimeFromCts(const char* reason);
 static int calculateWeekday(int year, int month, int day);
+//static void drawStepIconStatic();
 static float sin_table[60];
 static float cos_table[60];
 
@@ -645,6 +657,58 @@ static void drawStepCount(uint16_t steps) {
   //canvas.setTextDatum(prev_datum);
 }
 
+/*static void drawStepIconStatic() {
+  const int icon_x = STEP_BOX_X + 4;
+  const int icon_y = STEP_BOX_Y + (STEP_BOX_HEIGHT - 40) / 2;
+  clockbase.drawBitmap(icon_x, icon_y, steps_bitmap, 40, 40, transpalette, 15);
+}*/
+
+static void drawInfoScreen(uint32_t now_ms) {
+  gfx.fillScreen(TFT_BLACK);
+  gfx.setTextColor(TFT_WHITE, TFT_BLACK);
+  gfx.setFont(&lgfx::v1::fonts::Font2);
+  gfx.setTextDatum(lgfx::middle_center);
+
+  char line[80];
+  const int cx = gfx.width() / 2;
+  int y = 50;
+  const int dy = 20;
+
+  uint32_t uptime_s = now_ms / 1000;
+  uint32_t last_cts_age_s = last_cts_sync_ms ? (now_ms - last_cts_sync_ms) / 1000 : 0;
+
+  snprintf(line, sizeof(line), "Uptime: %lus", static_cast<unsigned long>(uptime_s));
+  gfx.drawString(line, cx, y);
+  y += dy;
+
+  if (last_cts_sync_ms) {
+    snprintf(line, sizeof(line), "Last CTS: %lus ago", static_cast<unsigned long>(last_cts_age_s));
+  } else {
+    snprintf(line, sizeof(line), "Last CTS: never");
+  }
+  gfx.drawString(line, cx, y);
+  y += dy;
+
+  snprintf(line, sizeof(line), "Steps: %u", static_cast<unsigned>(step_count));
+  gfx.drawString(line, cx, y);
+  y += dy;
+
+  snprintf(line, sizeof(line), "Resets: %lu", static_cast<unsigned long>(reset_counter));
+  gfx.drawString(line, cx, y);
+  y += dy;
+
+  snprintf(line, sizeof(line), "Battery: %u%% %s", battery_percent, digitalRead(PIN_CHG) == LOW ? "(chg)" : "(disch)");
+  gfx.drawString(line, cx, y);
+  y += dy;
+
+  gfx.drawString(backlight_level ? "Backlight: on" : "Backlight: off", cx, y);
+  y += dy;
+  gfx.drawString(info_mode ? "Screen: info" : "Screen: clock", cx, y);
+
+  last_info_render_ms = now_ms;
+  info_dirty = false;
+}
+
 
 
 
@@ -684,10 +748,6 @@ static void drawClock(uint64_t time_ms) {
    //update7Seg((minute / 60) % 24, minute % 60);
   }
 
-  if (time_ms - last_batt_update_ms > 60000 || time_ms < last_batt_update_ms) {
-    last_batt_update_ms = time_ms;
-    battery_percent = readBatteryPercent();
-  }
   bool charging = digitalRead(PIN_CHG) == LOW;
   bool backlight_on = backlight_level > 0;
 
@@ -792,9 +852,7 @@ static void initSprites() {
 
   needle2.fillScreen(9); //seconds hand sprite
   needle2.fillRect(0, 99, 1, 2, 9);
-  
-  
-  
+  //drawStepIconStatic();
   gfx.startWrite();
 }
 
@@ -812,6 +870,11 @@ void setup() {
   pinMode(PIN_CHG, INPUT_PULLUP);
   pinMode(IMU_INT1_PIN, INPUT_PULLUP);
   pinMode(IMU_INT2_PIN, INPUT_PULLUP);
+  pinMode(PIN_BTN, INPUT_PULLUP);
+  prefs.begin("watch", false);
+  reset_counter = prefs.getUInt("reset_count", 0);
+  ++reset_counter;
+  prefs.putUInt("reset_count", reset_counter);
   
   backlight(0);
 
@@ -886,6 +949,23 @@ void loop() {
     last_step_poll_ms = now_ms;
   }
 
+  if (now_ms - last_batt_update_ms > 60000 || now_ms < last_batt_update_ms) {
+    last_batt_update_ms = now_ms;
+    battery_percent = readBatteryPercent();
+  }
+
+  // Button toggle (active low on PIN_BTN)
+  bool btn = digitalRead(PIN_BTN) == LOW;
+  if (btn != button_state && (now_ms - last_button_ms) > BUTTON_DEBOUNCE_MS) {
+    button_state = btn;
+    last_button_ms = now_ms;
+    if (btn) { // pressed
+      info_mode = !info_mode;
+      info_dirty = true;
+      triggerBacklight(now_ms);
+    }
+  }
+
   if (now_ms - last_debug_ms > 2000) {
     last_debug_ms = now_ms;
     Serial.printf("DBG alive t=%lu bl=%u ramp=%d deadline=%lu imu_ready=%d pedo=%d irq1=%d irq2=%d steps=%u\n",
@@ -910,5 +990,11 @@ void loop() {
   }
 
   updateBacklight(now_ms);
-  drawClock(count_ms);
+  if (info_mode) {
+    if (info_dirty || (now_ms - last_info_render_ms) > 1000) {
+      drawInfoScreen(now_ms);
+    }
+  } else {
+    drawClock(count_ms);
+  }
 }
