@@ -14,6 +14,14 @@
 
 #define TFT_BL 7
 #define TFT_PWR 18
+#define IMU_INT1_PIN 17
+#define IMU_INT2_PIN 14
+
+static uint8_t imu_addr = 0x6A;            // LSM6DSLTR (default, may be 0x6B if SDO pulled high)
+static constexpr uint8_t IMU_WHOAMI = 0x6A;
+static constexpr uint16_t BACKLIGHT_MAX_DUTY = 1023;
+static constexpr uint32_t BACKLIGHT_ON_TIME_MS = 10000;
+static constexpr uint32_t BACKLIGHT_FADE_MS = 1000;
 
 LGFX_Hacktor gfx;
 LGFX_Sprite canvas(&gfx);
@@ -29,6 +37,17 @@ static constexpr int32_t clock_center = clock_size / 2;
 static constexpr auto transpalette = 0;
 static float zoom = 1.0f;
 static uint64_t count_ms = 0;
+static uint32_t backlight_on_deadline = 0;
+static uint32_t backlight_ramp_start = 0;
+static uint16_t backlight_level = BACKLIGHT_MAX_DUTY + 1;
+static bool backlight_ramping = false;
+static volatile bool imu_interrupt = false;
+static bool imu_ready = false;
+static uint32_t last_debug_ms = 0;
+static volatile bool imu_interrupt2 = false;
+static uint32_t last_wake_trigger_ms = 0;
+static constexpr uint8_t IMU_WAKE_THRESHOLD = 0x0A;     // higher = less sensitive (~62.5 mg/LSB at 2g)
+static constexpr uint32_t WAKE_COOLDOWN_MS = 2000;      // ignore new wake events inside this window
 static float sin_table[60];
 static float cos_table[60];
 
@@ -138,12 +157,44 @@ static void backlight(uint16_t duty) {
     ledcAttach(TFT_BL, 1000, 10);  // 1 kHz PWM, 10-bit resolution
     ledc_initialized = true;
   }
+  if (duty == backlight_level) {
+    return;
+  }
+  backlight_level = duty;
   ledcWrite(TFT_BL, duty);
 }
 
 static void power(uint8_t mode) {
   pinMode(TFT_PWR, OUTPUT);
   digitalWrite(TFT_PWR, mode);
+}
+
+static bool imuWriteRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(imu_addr);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+static bool imuReadRegister(uint8_t reg, uint8_t& value) {
+  Wire.beginTransmission(imu_addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+  if (Wire.requestFrom(imu_addr, static_cast<uint8_t>(1)) != 1) {
+    return false;
+  }
+  value = Wire.read();
+  return true;
+}
+
+static void IRAM_ATTR imuInterruptHandler() {
+  imu_interrupt = true;
+}
+
+static void IRAM_ATTR imuInterruptHandler2() {
+  imu_interrupt2 = true;
 }
 
 static uint16_t readRegister16(uint8_t reg) {
@@ -163,12 +214,105 @@ static uint8_t readBatteryPercent() {
   return static_cast<uint8_t>(std::min<uint16_t>(100, raw >> 8));
 }
 
+static void clearImuInterruptSource() {
+  uint8_t _unused = 0;
+  imuReadRegister(0x1B, _unused); // WAKE_UP_SRC (also clears latched wake events)
+}
+
+static void i2cScan() {
+  Serial.println("I2C scan start");
+  for (uint8_t addr = 1; addr < 0x7F; ++addr) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf(" - found device at 0x%02X\n", addr);
+    }
+    delay(2);
+  }
+  Serial.println("I2C scan done");
+}
+
+static bool initImuWakeGesture() {
+  uint8_t whoami = 0;
+  Serial.println("IMU init start");
+
+  const uint8_t candidates[] = {0x6A, 0x6B};
+  bool found_addr = false;
+  for (uint8_t addr : candidates) {
+    imu_addr = addr;
+    if (imuReadRegister(0x0F, whoami)) {
+      Serial.printf("IMU candidate 0x%02X WHOAMI=0x%02X\n", addr, whoami);
+      if (whoami == IMU_WHOAMI) {
+        found_addr = true;
+        break;
+      }
+    } else {
+      Serial.printf("IMU candidate 0x%02X WHOAMI read failed\n", addr);
+    }
+  }
+  if (!found_addr) {
+    Serial.println("IMU not detected on 0x6A/0x6B");
+    return false;
+  }
+
+  bool ok = true;
+  ok &= imuWriteRegister(0x12, 0x44); // CTRL3_C: BDU = 1, IF_INC = 1
+  ok &= imuWriteRegister(0x10, 0x40); // CTRL1_XL: 104 Hz, 2g, BW = 400 Hz
+  ok &= imuWriteRegister(0x18, 0x38); // CTRL9_XL: enable X, Y, Z accelerometer axes
+
+  ok &= imuWriteRegister(0x58, 0x80); // TAP_CFG: LIR (latch interrupts)
+  ok &= imuWriteRegister(0x5B, IMU_WAKE_THRESHOLD); // WAKE_UP_THS: threshold (higher = less sensitive)
+  ok &= imuWriteRegister(0x5C, 0x00); // WAKE_UP_DUR: no additional duration requirement
+  ok &= imuWriteRegister(0x5E, 0x20); // MD1_CFG: route wake-up interrupt to INT1
+  ok &= imuWriteRegister(0x5F, 0x20); // MD2_CFG: route wake-up interrupt to INT2
+
+  if (!ok) {
+    Serial.println("IMU register write failed");
+    return false;
+  }
+
+  clearImuInterruptSource();    // clear any stale wake flags
+  Serial.println("IMU init done; waiting for wake interrupts on INT1");
+  return true;
+}
+
 static uint32_t compileTimeSeconds() {
   const char* t = __TIME__;  // "hh:mm:ss"
   uint32_t hour = (t[0] - '0') * 10 + (t[1] - '0');
   uint32_t minute = (t[3] - '0') * 10 + (t[4] - '0');
   uint32_t second = (t[6] - '0') * 10 + (t[7] - '0');
   return hour * 3600UL + minute * 60UL + second;
+}
+
+static void triggerBacklight(uint32_t now_ms) {
+  backlight_on_deadline = now_ms + BACKLIGHT_ON_TIME_MS;
+  backlight_ramp_start = 0;
+  backlight_ramping = false;
+  backlight(BACKLIGHT_MAX_DUTY);
+}
+
+static void updateBacklight(uint32_t now_ms) {
+  if (backlight_on_deadline == 0) {
+    return;
+  }
+
+  if (backlight_ramping) {
+    uint32_t elapsed = now_ms - backlight_ramp_start;
+    if (elapsed >= BACKLIGHT_FADE_MS) {
+      backlight(0);
+      backlight_on_deadline = 0;
+      backlight_ramping = false;
+      backlight_ramp_start = 0;
+    } else {
+      uint32_t duty = (BACKLIGHT_MAX_DUTY * (BACKLIGHT_FADE_MS - elapsed)) / BACKLIGHT_FADE_MS;
+      backlight(static_cast<uint16_t>(duty));
+    }
+    return;
+  }
+
+  if (static_cast<int32_t>(backlight_on_deadline - now_ms) <= 0) {
+    backlight_ramping = true;
+    backlight_ramp_start = now_ms;
+  }
 }
 
 static bool isLeapYear(int year) {
@@ -436,11 +580,30 @@ static void initSprites() {
 }
 
 void setup() {
-  Serial.begin(115200);
-  Wire.begin();
-  pinMode(PIN_CHG, INPUT_PULLUP);
-  backlight(1023);
   power(HIGH);
+  Serial.begin(115200);
+  unsigned long wait_start = millis();
+  while (!Serial && (millis() - wait_start) < 2000) {
+    delay(10);
+  }
+  Serial.println("\nBooting...");
+  Wire.begin();
+  Wire.setClock(400000);
+  i2cScan();
+  pinMode(PIN_CHG, INPUT_PULLUP);
+  pinMode(IMU_INT1_PIN, INPUT_PULLUP);
+  pinMode(IMU_INT2_PIN, INPUT_PULLUP);
+  
+  backlight(0);
+
+  imu_ready = initImuWakeGesture();
+  if (imu_ready) {
+    attachInterrupt(digitalPinToInterrupt(IMU_INT1_PIN), imuInterruptHandler, RISING);
+    attachInterrupt(digitalPinToInterrupt(IMU_INT2_PIN), imuInterruptHandler2, RISING);
+    Serial.println("INT1/INT2 interrupts attached");
+  } else {
+    Serial.println("IMU init failed; backlight will only respond to manual triggers");
+  }
 
   gfx.init();
   gfx.setColorDepth(16);
@@ -453,12 +616,14 @@ void setup() {
   initSprites();
   battery_percent = readBatteryPercent();
   count_ms = static_cast<uint64_t>(compileTimeSeconds()) * 1000ULL;
+  triggerBacklight(lgfx::millis());  // initial wake so the face is visible on boot
   drawClock(count_ms);
 }
 
 void loop() {
   static uint32_t previous_tick = 0;
-  uint32_t milli = lgfx::millis() % 1000;
+  uint32_t now_ms = lgfx::millis();
+  uint32_t milli = now_ms % 1000;
   if (previous_tick > milli) {
     count_ms += 1000 + (milli - previous_tick);
   } else {
@@ -466,5 +631,41 @@ void loop() {
   }
   previous_tick = milli;
 
+  if (imu_interrupt || imu_interrupt2) {
+    imu_interrupt = false;
+    imu_interrupt2 = false;
+    uint8_t wake_src = 0;
+    uint8_t status_reg = 0;
+    if (imu_ready) {
+      if (!imuReadRegister(0x1B, wake_src)) {
+        Serial.println("IMU: failed to read WAKE_UP_SRC");
+      }
+      if (!imuReadRegister(0x1E, status_reg)) {
+        Serial.println("IMU: failed to read STATUS_REG");
+      }
+      clearImuInterruptSource(); // ensure interrupt is de-latched even if reads failed
+    }
+    bool within_cooldown = (now_ms - last_wake_trigger_ms) < WAKE_COOLDOWN_MS;
+    Serial.printf("IMU interrupt @ %lu ms: WAKE_UP_SRC=0x%02X STATUS=0x%02X cooldown=%d\n",
+                  static_cast<unsigned long>(now_ms), wake_src, status_reg, within_cooldown);
+    if (!within_cooldown) {
+      last_wake_trigger_ms = now_ms;
+      triggerBacklight(now_ms);
+    }
+  }
+
+  if (now_ms - last_debug_ms > 2000) {
+    last_debug_ms = now_ms;
+    Serial.printf("DBG alive t=%lu bl=%u ramp=%d deadline=%lu imu_ready=%d irq1=%d irq2=%d\n",
+                  static_cast<unsigned long>(now_ms),
+                  backlight_level,
+                  backlight_ramping,
+                  static_cast<unsigned long>(backlight_on_deadline),
+                  imu_ready,
+                  digitalRead(IMU_INT1_PIN),
+                  digitalRead(IMU_INT2_PIN));
+  }
+
+  updateBacklight(now_ms);
   drawClock(count_ms);
 }
