@@ -48,6 +48,18 @@ static volatile bool imu_interrupt2 = false;
 static uint32_t last_wake_trigger_ms = 0;
 static constexpr uint8_t IMU_WAKE_THRESHOLD = 0x0A;     // higher = less sensitive (~62.5 mg/LSB at 2g)
 static constexpr uint32_t WAKE_COOLDOWN_MS = 2000;      // ignore new wake events inside this window
+static uint16_t step_count = 0;
+static bool steps_dirty = true;
+static uint32_t last_step_poll_ms = 0;
+static constexpr uint32_t STEP_REFRESH_MS = 3000;
+static bool pedometer_enabled = false;
+static constexpr int STEP_BOX_WIDTH = 120;
+static constexpr int STEP_BOX_HEIGHT = 40;
+static constexpr int STEP_BOX_X = clock_center - (STEP_BOX_WIDTH / 2);
+static constexpr int STEP_BOX_Y = clock_center + 50 - (STEP_BOX_HEIGHT / 2);
+
+static bool imuWriteRegister(uint8_t reg, uint8_t value);
+static bool imuReadRegister(uint8_t reg, uint8_t& value);
 static float sin_table[60];
 static float cos_table[60];
 
@@ -214,9 +226,69 @@ static uint8_t readBatteryPercent() {
   return static_cast<uint8_t>(std::min<uint16_t>(100, raw >> 8));
 }
 
+static bool readStepCounter(uint16_t& steps) {
+  uint8_t lo = 0;
+  uint8_t hi = 0;
+  if (!imuReadRegister(0x4B, lo)) {
+    return false;
+  }
+  if (!imuReadRegister(0x4C, hi)) {
+    return false;
+  }
+  steps = static_cast<uint16_t>((hi << 8) | lo);
+  return true;
+}
+
+static void dumpPedometerConfig() {
+  uint8_t val = 0;
+  imuReadRegister(0x19, val); // CTRL10_C
+  Serial.printf("PEDO CFG: CTRL10_C=0x%02X\n", val);
+
+  imuWriteRegister(0x01, 0x80); // enter embedded func reg bank
+  uint8_t emb_a = 0, emb_b = 0;
+  imuReadRegister(0x04, emb_a); // EMB_FUNC_EN_A
+  imuReadRegister(0x05, emb_b); // EMB_FUNC_EN_B
+  imuWriteRegister(0x01, 0x00); // return to user bank
+  Serial.printf("PEDO CFG: EMB_FUNC_EN_A=0x%02X EMB_FUNC_EN_B=0x%02X\n", emb_a, emb_b);
+
+  uint16_t steps = 0;
+  if (readStepCounter(steps)) {
+    Serial.printf("PEDO CFG: initial step count=%u\n", static_cast<unsigned>(steps));
+  } else {
+    Serial.println("PEDO CFG: failed to read step counter");
+  }
+}
+
 static void clearImuInterruptSource() {
   uint8_t _unused = 0;
   imuReadRegister(0x1B, _unused); // WAKE_UP_SRC (also clears latched wake events)
+}
+
+static bool enablePedometer() {
+  bool ok = true;
+  // Enable embedded function register access (set FUNC_CFG_ACCESS.FUNC_CFG_EN=1)
+  ok &= imuWriteRegister(0x01, 0x80);
+  // Enable pedometer in embedded function enable register B (PEDO_EN should be bit4)
+  ok &= imuWriteRegister(0x04, 0x00); // EMB_FUNC_EN_A: keep other funcs off
+  ok &= imuWriteRegister(0x05, 0x10); // EMB_FUNC_EN_B: pedometer enable
+  // Return to user bank
+  ok &= imuWriteRegister(0x01, 0x00);
+
+  // Reset step counter then enable pedometer + embedded functions in CTRL10_C
+  ok &= imuWriteRegister(0x19, 0x6C); // CTRL10_C: FUNC_EN | PEDO_EN | PEDO_RST_STEP | (keep bit5 set)
+  delay(5);
+  ok &= imuWriteRegister(0x19, 0x3C); // CTRL10_C: FUNC_EN | PEDO_EN | keep bit5 set, no reset
+
+  if (!ok) {
+    Serial.println("Pedometer enable failed");
+    pedometer_enabled = false;
+  } else {
+    pedometer_enabled = true;
+    Serial.println("Pedometer enabled");
+    step_count = 0;
+    steps_dirty = true;
+  }
+  return ok;
 }
 
 static void i2cScan() {
@@ -270,7 +342,14 @@ static bool initImuWakeGesture() {
     return false;
   }
 
+  enablePedometer(); // best-effort; keep wake interrupt even if pedometer setup fails
+  if (pedometer_enabled) {
+    dumpPedometerConfig();
+  }
   clearImuInterruptSource();    // clear any stale wake flags
+  if (!pedometer_enabled) {
+    Serial.println("Pedometer did not enable; step counter may stay at 0");
+  }
   Serial.println("IMU init done; waiting for wake interrupts on INT1");
   return true;
 }
@@ -438,6 +517,28 @@ static void drawBatteryGauge(uint8_t percent, bool charging) {
   clockbase.setTextDatum(prev_datum);
 }
 
+static void drawStepCount(uint16_t steps) {
+  //auto prev_font = canvas.getFont();
+  //auto prev_datum = canvas.getTextDatum();
+
+  // clear numeric area only; icon is drawn once on clockbase
+  //const int text_area_x = STEP_BOX_X;
+  //const int text_area_w = STEP_BOX_WIDTH;
+  //canvas.fillRect(text_area_x, STEP_BOX_Y, text_area_w, STEP_BOX_HEIGHT, 14);
+
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(steps));
+  canvas.setFont(&lgfx::v1::fonts::Font2);
+  canvas.setTextDatum(lgfx::middle_center);
+  canvas.setTextColor(12, 6);
+  canvas.drawString(buf, 120, 170);
+
+  //canvas.setFont(prev_font);
+  //canvas.setTextDatum(prev_datum);
+}
+
+
+
 static void update7Seg(int32_t hour, int32_t minute) {
   int x = clockbase.getPivotX() - 69;
   int y = clockbase.getPivotY();
@@ -478,9 +579,15 @@ static void drawClock(uint64_t time_ms) {
     battery_percent = readBatteryPercent();
   }
   bool charging = digitalRead(PIN_CHG) == LOW;
+  bool backlight_on = backlight_level > 0;
+
   clockbase.pushSprite(0, 0);
   drawBatteryGauge(battery_percent, charging);
-  stepsIcon.pushSprite(clock_center - (stepsIcon.width() >> 1), clock_center + 30, transpalette);
+  //stepsIcon.pushSprite(clock_center - (stepsIcon.width() >> 1), clock_center + 30, transpalette);
+  
+
+  drawStepCount(step_count); // draw below hands so hands stay on top
+  steps_dirty = false;
 
   drawDot(minute % 60, 14);
   drawDot(((minute / 60) * 5) % 60, 14);
@@ -576,6 +683,7 @@ static void initSprites() {
   needle2.fillScreen(9); //seconds hand sprite
   needle2.fillRect(0, 99, 1, 2, 9);
   
+  
   gfx.startWrite();
 }
 
@@ -654,16 +762,30 @@ void loop() {
     }
   }
 
+  bool backlight_on = backlight_level > 0;
+  if (imu_ready && backlight_on && (now_ms - last_step_poll_ms >= STEP_REFRESH_MS)) {
+    uint16_t steps = 0;
+    if (readStepCounter(steps)) {
+      step_count = steps;
+      steps_dirty = true;
+    } else {
+      Serial.println("Step counter read failed");
+    }
+    last_step_poll_ms = now_ms;
+  }
+
   if (now_ms - last_debug_ms > 2000) {
     last_debug_ms = now_ms;
-    Serial.printf("DBG alive t=%lu bl=%u ramp=%d deadline=%lu imu_ready=%d irq1=%d irq2=%d\n",
+    Serial.printf("DBG alive t=%lu bl=%u ramp=%d deadline=%lu imu_ready=%d pedo=%d irq1=%d irq2=%d steps=%u\n",
                   static_cast<unsigned long>(now_ms),
                   backlight_level,
                   backlight_ramping,
                   static_cast<unsigned long>(backlight_on_deadline),
                   imu_ready,
+                  pedometer_enabled,
                   digitalRead(IMU_INT1_PIN),
-                  digitalRead(IMU_INT2_PIN));
+                  digitalRead(IMU_INT2_PIN),
+                  static_cast<unsigned>(step_count));
   }
 
   updateBacklight(now_ms);
