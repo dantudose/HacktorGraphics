@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <Wire.h>
+#include <NimBLEDevice.h>
 #include "LGFX_Hacktor.hpp"
 
 #define PIN_CHG 21
@@ -58,8 +59,21 @@ static constexpr int STEP_BOX_HEIGHT = 40;
 static constexpr int STEP_BOX_X = clock_center - (STEP_BOX_WIDTH / 2);
 static constexpr int STEP_BOX_Y = clock_center + 50 - (STEP_BOX_HEIGHT / 2);
 
+// BLE CTS (Current Time Service)
+static constexpr uint32_t CTS_SYNC_INTERVAL_MS = 3600000; // hourly
+static constexpr uint32_t CTS_RETRY_MS = 300000;         // retry after 5 min on failure
+static const NimBLEUUID CTS_SERVICE_UUID = NimBLEUUID((uint16_t)0x1805);
+static const NimBLEUUID CTS_CHAR_UUID = NimBLEUUID((uint16_t)0x2A2B);
+static bool ble_initialized = false;
+static bool cts_sync_in_progress = false;
+static uint32_t last_cts_sync_ms = 0;
+static uint32_t last_cts_attempt_ms = 0;
+
 static bool imuWriteRegister(uint8_t reg, uint8_t value);
 static bool imuReadRegister(uint8_t reg, uint8_t& value);
+
+static bool syncTimeFromCts(const char* reason);
+static int calculateWeekday(int year, int month, int day);
 static float sin_table[60];
 static float cos_table[60];
 
@@ -262,6 +276,100 @@ static void dumpPedometerConfig() {
 static void clearImuInterruptSource() {
   uint8_t _unused = 0;
   imuReadRegister(0x1B, _unused); // WAKE_UP_SRC (also clears latched wake events)
+}
+
+static void applyCtsTime(uint16_t year, uint8_t month, uint8_t day, uint8_t hour, uint8_t minute, uint8_t second) {
+  start_date.year = year;
+  start_date.month = month;
+  start_date.day = day;
+  start_date.wday = calculateWeekday(year, month, day);
+  last_rendered_day = -1;
+
+  uint32_t sec_of_day = static_cast<uint32_t>(hour) * 3600UL + static_cast<uint32_t>(minute) * 60UL + static_cast<uint32_t>(second);
+  count_ms = static_cast<uint64_t>(sec_of_day) * 1000ULL;
+  Serial.printf("CTS time applied: %04u-%02u-%02u %02u:%02u:%02u\n",
+                static_cast<unsigned>(year), month, day, hour, minute, second);
+}
+
+static const NimBLEAddress CTS_SERVER_ADDR_RANDOM = NimBLEAddress("5e:d7:d0:ce:90:96", BLE_ADDR_RANDOM);
+
+static bool syncTimeFromCts(const char* reason) {
+  if (cts_sync_in_progress) {
+    return false;
+  }
+  cts_sync_in_progress = true;
+  last_cts_attempt_ms = lgfx::millis();
+
+  if (!ble_initialized) {
+    NimBLEDevice::init("HacktorWatch");
+    ble_initialized = true;
+  }
+
+  bool updated = false;
+  auto tryConnect = [&](const NimBLEAddress& addr, const char* label) -> NimBLEClient* {
+    Serial.printf("CTS sync (%s): connecting to %s (%s)...\n", reason, addr.toString().c_str(), label);
+    NimBLEClient* c = NimBLEDevice::createClient();
+    if (!c->connect(addr)) {
+      Serial.printf("CTS direct connect failed (%s)\n", label);
+      NimBLEDevice::deleteClient(c);
+      return nullptr;
+    }
+    return c;
+  };
+
+  NimBLEClient* client = tryConnect(CTS_SERVER_ADDR_RANDOM, "random");
+  if (!client) {
+    cts_sync_in_progress = false;
+    return false;
+  }
+
+  NimBLERemoteService* svc = client->getService(CTS_SERVICE_UUID);
+  if (!svc) {
+    Serial.println("CTS service not found");
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    cts_sync_in_progress = false;
+    return false;
+  }
+  NimBLERemoteCharacteristic* chr = svc->getCharacteristic(CTS_CHAR_UUID);
+  if (!chr || !chr->canRead()) {
+    Serial.println("CTS characteristic not readable");
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    cts_sync_in_progress = false;
+    return false;
+  }
+
+  std::string val = chr->readValue();
+  if (val.size() < 7) {
+    Serial.printf("CTS payload too short: %u bytes\n", static_cast<unsigned>(val.size()));
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    cts_sync_in_progress = false;
+    return false;
+  }
+
+  const uint8_t* d = reinterpret_cast<const uint8_t*>(val.data());
+  uint16_t year = static_cast<uint16_t>(d[0] | (d[1] << 8));
+  uint8_t month = d[2];
+  uint8_t day = d[3];
+  uint8_t hour = d[4];
+  uint8_t minute = d[5];
+  uint8_t second = d[6];
+
+  applyCtsTime(year, month, day, hour, minute, second);
+  last_cts_sync_ms = lgfx::millis();
+  updated = true;
+  client->disconnect();
+  NimBLEDevice::deleteClient(client);
+
+  if (!updated) {
+    Serial.println("CTS sync failed");
+  } else {
+    Serial.println("CTS sync complete");
+  }
+  cts_sync_in_progress = false;
+  return updated;
 }
 
 static bool enablePedometer() {
@@ -522,9 +630,9 @@ static void drawStepCount(uint16_t steps) {
   //auto prev_datum = canvas.getTextDatum();
 
   // clear numeric area only; icon is drawn once on clockbase
-  //const int text_area_x = STEP_BOX_X;
-  //const int text_area_w = STEP_BOX_WIDTH;
-  //canvas.fillRect(text_area_x, STEP_BOX_Y, text_area_w, STEP_BOX_HEIGHT, 14);
+  //const int text_area_x = STEP_BOX_X + 48;
+  //const int text_area_w = STEP_BOX_WIDTH - 52;
+  //canvas.fillRect(text_area_x, STEP_BOX_Y, text_area_w, STEP_BOX_HEIGHT, 6);
 
   char buf[12];
   snprintf(buf, sizeof(buf), "%u", static_cast<unsigned>(steps));
@@ -536,6 +644,8 @@ static void drawStepCount(uint16_t steps) {
   //canvas.setFont(prev_font);
   //canvas.setTextDatum(prev_datum);
 }
+
+
 
 
 
@@ -684,6 +794,7 @@ static void initSprites() {
   needle2.fillRect(0, 99, 1, 2, 9);
   
   
+  
   gfx.startWrite();
 }
 
@@ -725,6 +836,7 @@ void setup() {
   battery_percent = readBatteryPercent();
   count_ms = static_cast<uint64_t>(compileTimeSeconds()) * 1000ULL;
   triggerBacklight(lgfx::millis());  // initial wake so the face is visible on boot
+  syncTimeFromCts("boot");
   drawClock(count_ms);
 }
 
@@ -786,6 +898,15 @@ void loop() {
                   digitalRead(IMU_INT1_PIN),
                   digitalRead(IMU_INT2_PIN),
                   static_cast<unsigned>(step_count));
+  }
+
+  if (!cts_sync_in_progress) {
+    bool never_synced = (last_cts_sync_ms == 0);
+    bool due_hourly = (!never_synced) && (now_ms - last_cts_sync_ms >= CTS_SYNC_INTERVAL_MS);
+    bool due_retry = (now_ms - last_cts_attempt_ms >= CTS_RETRY_MS);
+    if ((never_synced && due_retry) || (due_hourly && due_retry)) {
+      syncTimeFromCts(never_synced ? "retry" : "periodic");
+    }
   }
 
   updateBacklight(now_ms);
