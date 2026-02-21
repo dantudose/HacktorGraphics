@@ -68,6 +68,7 @@ static uint32_t last_info_render_ms = 0;
 // BLE CTS (Current Time Service)
 static constexpr uint32_t CTS_SYNC_INTERVAL_MS = 3600000; // hourly
 static constexpr uint32_t CTS_RETRY_MS = 300000;         // retry after 5 min on failure
+static constexpr uint32_t CTS_SCAN_DURATION_MS = 5000;
 static const NimBLEUUID CTS_SERVICE_UUID = NimBLEUUID((uint16_t)0x1805);
 static const NimBLEUUID CTS_CHAR_UUID = NimBLEUUID((uint16_t)0x2A2B);
 static bool ble_initialized = false;
@@ -303,7 +304,47 @@ static void applyCtsTime(uint16_t year, uint8_t month, uint8_t day, uint8_t hour
                 static_cast<unsigned>(year), month, day, hour, minute, second);
 }
 
-static const NimBLEAddress CTS_SERVER_ADDR_RANDOM = NimBLEAddress("5e:d7:d0:ce:90:96", BLE_ADDR_RANDOM);
+static bool findCtsServer(NimBLEAddress& out_addr, const char* reason) {
+  NimBLEScan* scan = NimBLEDevice::getScan();
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(100);
+
+  std::string uuid_str = CTS_SERVICE_UUID.toString();
+  Serial.printf("CTS scan (%s): searching for service %s for %lu ms...\n",
+                reason, uuid_str.c_str(), static_cast<unsigned long>(CTS_SCAN_DURATION_MS));
+
+  NimBLEScanResults results = scan->getResults(CTS_SCAN_DURATION_MS);
+  const int count = results.getCount();
+  if (count == 0) {
+    Serial.println("CTS scan: no BLE devices found");
+    scan->clearResults();
+    return false;
+  }
+
+  for (int i = 0; i < count; ++i) {
+    const NimBLEAdvertisedDevice* dev = results.getDevice(static_cast<uint32_t>(i));
+    if (!dev || !dev->isConnectable()) {
+      continue;
+    }
+    if (!dev->isAdvertisingService(CTS_SERVICE_UUID)) {
+      continue;
+    }
+    out_addr = dev->getAddress();
+    std::string name = dev->haveName() ? dev->getName() : std::string();
+    if (!name.empty()) {
+      Serial.printf("CTS scan: found %s (%s)\n", out_addr.toString().c_str(), name.c_str());
+    } else {
+      Serial.printf("CTS scan: found %s\n", out_addr.toString().c_str());
+    }
+    scan->clearResults();
+    return true;
+  }
+
+  Serial.println("CTS scan: no CTS advertiser found");
+  scan->clearResults();
+  return false;
+}
 
 static bool syncTimeFromCts(const char* reason) {
   if (cts_sync_in_progress) {
@@ -329,7 +370,13 @@ static bool syncTimeFromCts(const char* reason) {
     return c;
   };
 
-  NimBLEClient* client = tryConnect(CTS_SERVER_ADDR_RANDOM, "random");
+  NimBLEAddress cts_addr;
+  if (!findCtsServer(cts_addr, reason)) {
+    cts_sync_in_progress = false;
+    return false;
+  }
+
+  NimBLEClient* client = tryConnect(cts_addr, "scan");
   if (!client) {
     cts_sync_in_progress = false;
     return false;
