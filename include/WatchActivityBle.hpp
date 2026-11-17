@@ -9,8 +9,10 @@
 
 namespace watch {
 
-// Own the radio only during a visible inspection session. CTS and airplane
-// handling must wait for ownsRadio() to become false before using/deleting BLE.
+// Own the activity peripheral during a scheduled discovery/connection window.
+// Manual CTS may share the initialized host without deleting the server; it
+// waits for a phone to disconnect because this build supports one connection.
+// Window expiry, airplane and toggle-off stop the host before deleting objects.
 // Main-loop methods never run in a NimBLE callback.
 class WatchActivityBle {
  public:
@@ -51,7 +53,7 @@ class WatchActivityBle {
 
     advertising_ = NimBLEDevice::getAdvertising();
     if (!advertising_) return failedStart(now_ms);
-    advertising_->setAdvertisingInterval(1600); // 1 s in 0.625 ms units.
+    advertising_->setAdvertisingInterval(400); // 250 ms in 0.625 ms units.
     // The full name is in scan response because the 128-bit service UUID and
     // name together exceed the 31-byte legacy advertising payload.
     advertising_->enableScanResponse(true);

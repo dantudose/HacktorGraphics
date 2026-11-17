@@ -182,12 +182,58 @@ void moreControlsAndSyncAvailabilityAreHonored() {
   more(menu,data);
   assert(tap(menu,data,120,82).action == SettingsAction::NextTimeout);
   data.sync_available = false;
-  assert(tap(menu,data,120,127).action == SettingsAction::None);
+  assert(tap(menu,data,120,145).action == SettingsAction::None);
   data.sync_available = true;
-  assert(tap(menu,data,120,127).action == SettingsAction::SyncTime);
-  menu.update(data,true,120,127,2000);
+  assert(tap(menu,data,120,145).action == SettingsAction::SyncTime);
+  menu.update(data,true,120,145,2000);
   data.sync_available = false;
   assert(menu.update(data,false,0,0,2100).action == SettingsAction::None);
+}
+
+void advertisingToggleIsIndependentOfSyncAndAirplane() {
+  SettingsData data;
+  assert(data.values.ble_advertising);
+  SettingsMenu menu;
+  ready(menu,data);
+  more(menu,data);
+  data.sync_available = false;
+  data.values.airplane = true;
+  assert(tap(menu,data,120,109).action == SettingsAction::ToggleBleAdvertising);
+  assert(menu.page() == SettingsPage::More);
+  assert(data.values.ble_advertising && data.values.airplane);
+  data.values.ble_advertising = false;
+  assert(tap(menu,data,120,109).action == SettingsAction::ToggleBleAdvertising);
+  assert(!data.values.ble_advertising);
+}
+
+void advertisingButtonRequiresAReleasedTapAndCancelsDragging() {
+  SettingsData data;
+  SettingsMenu menu;
+  ready(menu,data);
+  more(menu,data);
+  assert(menu.update(data,true,120,109,3000).action == SettingsAction::None);
+  assert(menu.update(data,true,120,109,3500).action == SettingsAction::None);
+  assert(menu.update(data,false,0,0,3510).action == SettingsAction::ToggleBleAdvertising);
+  menu.update(data,true,120,109,4000);
+  menu.update(data,true,120,73,4020);
+  const auto event = menu.update(data,false,0,0,4040);
+  assert(event.action == SettingsAction::None);
+  assert(event.drawer_released && menu.isOpen());
+}
+
+void moreRowsHaveSeparateTouchTargetsInsideTheRoundDisplay() {
+  using watch::settings_detail::Hit;
+  using watch::settings_detail::hitTest;
+  const int centers[] = {73,109,145,181};
+  const Hit hits[] = {Hit::Timeout,Hit::BleAdvertising,Hit::Sync,Hit::Manual};
+  for (unsigned i = 0; i < 4; ++i) {
+    assert(hitTest(SettingsPage::More,42,centers[i]) == hits[i]);
+    assert(hitTest(SettingsPage::More,197,centers[i]) == hits[i]);
+    assert(hitTest(SettingsPage::More,198,centers[i]) == Hit::None);
+  }
+  for (int gap : {90,126,162,198}) {
+    assert(hitTest(SettingsPage::More,120,gap) == Hit::None);
+  }
 }
 
 void dateChangesClampLeapDaysAndOnlySaveApplies() {
@@ -297,11 +343,14 @@ int main() {
   capturedSliderClampsAndDoesNotBecomeSwipeUp();
   touchFailureCancelsUncommittedSlider();
   moreControlsAndSyncAvailabilityAreHonored();
+  advertisingToggleIsIndependentOfSyncAndAirplane();
+  advertisingButtonRequiresAReleasedTapAndCancelsDragging();
+  moreRowsHaveSeparateTouchTargetsInsideTheRoundDisplay();
   dateChangesClampLeapDaysAndOnlySaveApplies();
   dateBackNavigationNeverAppliesTheDraft();
   dateAdjustmentHoldRepeatsWithoutReleaseIncrement();
   adjustmentHoldSurvivesMillisRollover();
   clockValidationHandlesGregorianCenturiesAndBounds();
   screenBoundsAndClosedMenuCannotActivateControls();
-  std::puts("Settings menu: all 17 scenarios passed.");
+  std::puts("Settings menu: all 20 scenarios passed.");
 }

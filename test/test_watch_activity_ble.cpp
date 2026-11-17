@@ -33,7 +33,7 @@ void startsAReadableServiceAndSlowAdvertising() {
   assert(!state.server->auto_advertise);
   assert(state.server->services.size() == 1);
   assert(state.server->services.at(watch::activityServiceUuid())->characteristics.size() == 2);
-  assert(state.advertising->interval == 1600 && state.advertising->advertising);
+  assert(state.advertising->interval == 400 && state.advertising->advertising);
   assert(state.advertising->scan_response && state.advertising->name == "HacktorWatch");
   assert(state.advertising->service_uuid == watch::activityServiceUuid());
   const auto& steps = stepsCharacteristic();
@@ -89,7 +89,7 @@ void connectsRequestsConservativeParametersAndReadvertisesAfterDisconnect() {
   finish(ble, 1300);
 }
 
-void screenOffWaitsForGracefulDisconnectBeforeDeletingObjects() {
+void toggleOffWaitsForGracefulDisconnectBeforeDeletingObjects() {
   ble_test::reset();
   watch::WatchActivityBle ble;
   assert(ble.start(0, 10));
@@ -204,7 +204,7 @@ int main() {
   startsAReadableServiceAndSlowAdvertising();
   mainUpdatesOnlyTheAtomicAndReadCallbacksPublishCompleteValues();
   connectsRequestsConservativeParametersAndReadvertisesAfterDisconnect();
-  screenOffWaitsForGracefulDisconnectBeforeDeletingObjects();
+  toggleOffWaitsForGracefulDisconnectBeforeDeletingObjects();
   aStuckConnectionGetsABoundedShutdownFallback();
   failedHostShutdownKeepsTheObjectsAndRetriesSlowly();
   failedObjectClearAlsoRetainsTheLeaseUntilSuccessfulCleanup();

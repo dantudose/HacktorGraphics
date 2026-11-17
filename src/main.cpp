@@ -35,6 +35,8 @@
 #include "SettingsSlide.hpp"
 #include "PowerStats.hpp"
 #include "WatchActivityBle.hpp"
+#include "CtsBleCleanup.hpp"
+#include "BleAdvertisingSchedule.hpp"
 
 #define PIN_CHG 21
 #define PIN_BTN 0
@@ -171,6 +173,7 @@ static const NimBLEUUID CTS_SERVICE_UUID = NimBLEUUID((uint16_t)0x1805);
 static const NimBLEUUID CTS_CHAR_UUID = NimBLEUUID((uint16_t)0x2A2B);
 static bool ble_initialized = false;
 static watch::WatchActivityBle activity_ble;
+static watch::BleAdvertisingSchedule advertising_schedule;
 static bool cts_sync_in_progress = false;
 static bool cts_has_synced = false;
 static uint32_t last_cts_sync_ms = 0;
@@ -520,27 +523,31 @@ static bool findCtsServer(NimBLEAddress& out_addr, const char* reason) {
 }
 
 static bool syncTimeFromCts(const char* reason, bool quick_attempt) {
-  if (watch_settings.airplane || cts_sync_in_progress || activity_ble.ownsRadio()) {
+  // This SDK has one BLE connection slot. A phone can keep its connection;
+  // time sync waits until the slot is free, independently of advertising.
+  if (watch_settings.airplane || cts_sync_in_progress ||
+      activity_ble.closing() || activity_ble.connected()) {
     return false;
   }
   cts_sync_in_progress = true;
   last_cts_attempt_ms = lgfx::millis();
 
-  // Stop the host (including active connections) before deleting its objects.
-  // The guard also runs on scan, connection, and characteristic read failures.
+  // Share the host with the activity peripheral. Release only our private CTS
+  // client when sharing, including failed connection/discovery/read attempts.
   struct CtsSyncCleanup {
+    NimBLEClient* client = nullptr;
+    bool shared_radio;
+    explicit CtsSyncCleanup(bool shared) : shared_radio(shared) {}
     ~CtsSyncCleanup() {
-      // Keep objects alive if stopping the host fails: its callbacks may still
-      // reference them. Clear objects only after the host has stopped.
-      if (!NimBLEDevice::deinit(false) || !NimBLEDevice::deinit(true)) {
-        WATCH_LOG_E("CTS: BLE shutdown failed");
+      if (!watch::releaseCtsBle<NimBLEDevice>(client, shared_radio)) {
+        WATCH_LOG_E("CTS: BLE cleanup failed");
       }
       ble_initialized = NimBLEDevice::isInitialized();
       cts_sync_in_progress = false;
     }
-  } cleanup;
+  } cleanup(activity_ble.active());
 
-  if (!ble_initialized) {
+  if (!NimBLEDevice::isInitialized()) {
     ble_initialized = NimBLEDevice::init("HacktorWatch");
     if (!ble_initialized) {
       WATCH_LOG_E("CTS: BLE initialization failed");
@@ -551,6 +558,7 @@ static bool syncTimeFromCts(const char* reason, bool quick_attempt) {
   auto tryConnect = [&](const NimBLEAddress& addr, const char* label) -> NimBLEClient* {
     WATCH_LOG_D("CTS sync (%s): connecting to %s (%s)...", reason, addr.toString().c_str(), label);
     NimBLEClient* c = NimBLEDevice::createClient();
+    cleanup.client = c;
     if (!c) {
       WATCH_LOG_E("CTS: failed to create BLE client");
       return nullptr;
@@ -570,6 +578,9 @@ static bool syncTimeFromCts(const char* reason, bool quick_attempt) {
   if (!findCtsServer(cts_addr, reason)) {
     return false;
   }
+  // A phone may have joined while the synchronous scan was running. Preserve
+  // its connection instead of competing for the SDK's single connection slot.
+  if (activity_ble.connected()) return false;
 
   NimBLEClient* client = tryConnect(cts_addr, "scan");
   if (!client) {
@@ -1105,6 +1116,11 @@ static void handleSettingsEvent(const watch::SettingsEvent& event, uint32_t now_
       } else haptic_requests.requestConfirmation(now_ms);
       saveWatchSettings();
       break;
+    case watch::SettingsAction::ToggleBleAdvertising:
+      watch_settings.ble_advertising = !watch_settings.ble_advertising;
+      if (!watch_settings.ble_advertising) activity_ble.requestStop(now_ms);
+      saveWatchSettings();
+      break;
     case watch::SettingsAction::ToggleMotionWake:
       watch_settings.motion_wake = !watch_settings.motion_wake;
       imu_interrupt = false;
@@ -1330,11 +1346,14 @@ static watch::SettingsData currentSettingsData() {
                                   second / 3600U, second / 60U % 60U, second % 60U);
   data.sync_available = !watch_settings.airplane && !cts_sync_in_progress &&
       !manual_sync_requested && countdown.state() != watch::TimerState::Running &&
-      !haptic_alert.active() && !haptic_requests.pending() && !deferCtsForStepReset();
+      !haptic_alert.active() && !haptic_requests.pending() && !deferCtsForStepReset() &&
+      !activity_ble.closing() && !activity_ble.connected();
   data.sync_status = settings_status;
   if (!manual_sync_requested) {
     if (watch_settings.airplane)
       data.sync_status = activity_ble.ownsRadio() ? "Stopping radio..." : "Airplane mode on";
+    else if (activity_ble.closing()) data.sync_status = "Stopping radio...";
+    else if (activity_ble.connected()) data.sync_status = "Phone connected";
     else if (countdown.state() == watch::TimerState::Running) data.sync_status = "Timer running";
     else if (haptic_alert.active() || haptic_requests.pending()) data.sync_status = "Alert in progress";
     else if (deferCtsForStepReset()) data.sync_status = "Try after midnight";
@@ -1516,18 +1535,13 @@ static void serviceManualSync() {
   if (!manual_sync_requested || !manual_sync_presented ||
       !settings_menu.isOpen() || settings_slide.active()) return;
   if (watch_settings.airplane || countdown.state() == watch::TimerState::Running ||
-      haptic_alert.active() || haptic_requests.pending() || deferCtsForStepReset()) {
+      haptic_alert.active() || haptic_requests.pending() || deferCtsForStepReset() ||
+      activity_ble.closing() || activity_ble.connected()) {
     manual_sync_requested = false;
     manual_sync_presented = false;
     settings_dirty = true;
     return;
   }
-  // Manual sync shares the controller with the readable activity peripheral.
-  // Keep showing "Syncing..." until its asynchronous disconnect has completed.
-  activity_ble.requestStop(lgfx::millis());
-  activity_ble.service(lgfx::millis());
-  ble_initialized = NimBLEDevice::isInitialized();
-  if (activity_ble.ownsRadio()) return;
   manual_sync_requested = false;
   manual_sync_presented = false;
   const bool synced = syncTimeFromCts("manual", true);
@@ -1977,26 +1991,33 @@ static void restoreWakePins() {
 }
 
 static uint32_t nextCtsWaitMs(uint32_t now_ms) {
-  if (watch_settings.airplane) return MAX_STANDBY_SLEEP_MS;
+  if (watch_settings.airplane || activity_ble.closing() || activity_ble.connected())
+    return MAX_STANDBY_SLEEP_MS;
   return watch::ctsWaitMs(now_ms, cts_has_synced, last_cts_sync_ms, last_cts_attempt_ms,
                          CTS_SYNC_INTERVAL_MS, CTS_RETRY_MS);
 }
 
 static void serviceActivityBle(uint32_t now_ms) {
+  static bool was_connected = false;
   const bool owned_radio = activity_ble.ownsRadio();
-  const bool wanted = graphics_ready && !watch_settings.airplane &&
-      !cts_sync_in_progress && !manual_sync_requested &&
-      ((!display_sleeping && backlight_level > 0) || backlight_triggered);
+  advertising_schedule.setEnabled(graphics_ready && watch_settings.ble_advertising &&
+                                  !watch_settings.airplane);
+  if (!activity_ble.ownsRadio() && advertising_schedule.shouldStart(now_ms))
+    advertising_schedule.beginWindow(now_ms);
+  const bool wanted = advertising_schedule.keepRadio(now_ms, activity_ble.connected());
   activity_ble.updateValues(step_count);
   if (!wanted) activity_ble.requestStop(now_ms);
   activity_ble.service(now_ms);
-  // Start after rendering/lighting the screen; BLE setup cannot delay its first
-  // frame. No controller or advertising is retained for a dark watch.
+  // Short connectable windows leave the controller fully off between windows.
+  // CTS can share an active host without deleting its GATT.
   if (wanted && !activity_ble.ownsRadio() && !NimBLEDevice::isInitialized()) {
     activity_ble.start(now_ms, step_count);
   }
   ble_initialized = NimBLEDevice::isInitialized();
-  if (owned_radio != activity_ble.ownsRadio()) settings_dirty = true;
+  const bool connected = activity_ble.connected();
+  if (owned_radio != activity_ble.ownsRadio() || was_connected != connected)
+    settings_dirty = true;
+  was_connected = connected;
 }
 
 static void sleepUntilNextTask() {
@@ -2026,6 +2047,8 @@ static void sleepUntilNextTask() {
       static_cast<uint64_t>(haptic_alert.waitMs(lgfx::millis())) * 1000ULL);
   sleep_us = std::min<uint64_t>(sleep_us,
       static_cast<uint64_t>(nextDailyStepWaitMs(lgfx::millis(), esp_timer_get_time())) * 1000ULL);
+  sleep_us = std::min<uint64_t>(sleep_us,
+      static_cast<uint64_t>(advertising_schedule.waitMs(lgfx::millis())) * 1000ULL);
   if (sleep_us == 0) {
     return; // A scheduled task is already due; service it in the next loop.
   }

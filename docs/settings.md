@@ -55,15 +55,25 @@ The More page contains:
 - Set date/time: select year/month/day, adjust with −/+, tap Next, then edit
   hour/minute and Save. Hold −/+ to repeat. Gregorian leap days are validated;
   changing month/year clamps the day as needed. Saving sets seconds to zero.
+- BLE advertising: defaults to On. Tap to enable or disable three-second
+  discovery windows every five seconds, including while the display is asleep. A
+  connected phone gets up to 30 seconds for inspection before disconnection.
+  The choice is saved independently of CTS; Airplane mode suppresses both uses.
 
 Manual sync shows `Syncing...` before starting the existing synchronous BLE
 operation. It is unavailable in airplane mode, during a running timer or motor
-alert, and shortly before the midnight step reset; the menu shows the reason.
+alert, while a phone occupies the BLE connection slot, while the activity
+peripheral is shutting down, and shortly before the midnight step reset; the
+menu shows the reason.
 Manual connections use a five-second connect timeout and no connect retries.
 The interface waits for the attempt, including characteristic discovery/read.
-It first stops any [BLE activity inspection](ble-activity.md) connection because
-the peripheral and CTS client share the radio. Activity advertising can resume
-afterward while the screen is awake.
+The [activity peripheral](ble-activity.md) and CTS client share one radio and
+one connection slot. CTS waits for an attached phone to disconnect rather than
+interrupting it. With no phone attached, manual CTS can reuse the stack and
+release only its own client, preserving the activity service. An explicit
+manual attempt can extend the active discovery window while it blocks the main
+loop. Automatic CTS runs between discovery windows instead. Disabling BLE
+advertising does not disable time synchronization.
 
 Manual date/time changes affect the running watch clock and daily step date.
 Same-date changes preserve steps; another retained date restores its total and
@@ -79,7 +89,7 @@ unchanged totals do not trigger timestamp-only writes.
 
 ## Persistence and power
 
-The five preference values survive restarts in NVS. Only changed keys are saved.
+The six preference values survive restarts in NVS. Only changed keys are saved.
 Brightness is previewed live and saved on finger release; an interrupted edit
 reverts to the last saved value. There are no repeated saves during dragging.
 Date/time editing uses a draft until Save, so leaving the editor cancels it.
@@ -89,12 +99,21 @@ calendar dates. Clock edits do not force additional history writes. A reset
 normally loses only the most recent 30 minutes of activity; failed sensor reads,
 failed writes, or delayed service can extend that interval.
 
-With Airplane mode off, [BLE activity inspection](ble-activity.md) advertises
-while the screen is awake and exposes read-only daily steps and estimated
-distance to nRF Connect. Screen timeout disconnects the phone and stops the
-peripheral; BLE reads do not prolong the screen deadline. A 30-second screen
-timeout gives more time for manual inspection. Advertising and connections add
-screen-on energy use; battery impact needs hardware measurement.
+With Airplane mode off and BLE advertising On,
+[activity inspection](ble-activity.md) exposes read-only daily steps and
+estimated distance to nRF Connect during periodic discovery and bounded phone
+sessions. The screen does not control their schedule. BLE reads do not prolong
+the screen deadline, wake the display, force an IMU read, or save flash.
+Dark reads can return the cached total
+from the last visible refresh, midnight snapshot, or 30-minute checkpoint.
+The current SDK has automatic power management and Bluetooth modem sleep
+disabled, so the processor remains awake during each three-second discovery
+window and connected session. BLE shuts down between windows to allow normal
+processor light sleep. Without a phone, about three awake seconds per five-second
+cycle leave roughly two seconds for light sleep minus setup/cleanup overhead;
+this increases battery load compared with minute-spaced windows. Setting this
+toggle Off removes discovery wakes entirely.
+Battery impact still needs hardware measurement.
 
 The menu shares the existing canvas, redraws when its state/data changes, and
 adds no frame buffer, touch wake source, or standby polling. Airplane mode also

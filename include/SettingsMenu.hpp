@@ -8,7 +8,7 @@ namespace watch {
 
 enum class SettingsPage { Quick, Brightness, More, Date, Time };
 enum class SettingsAction {
-  None, Close, ToggleAirplane, ToggleVibration, ToggleMotionWake,
+  None, Close, ToggleAirplane, ToggleVibration, ToggleMotionWake, ToggleBleAdvertising,
   BrightnessPreview, BrightnessCommit, NextTimeout, SyncTime, ApplyTime
 };
 
@@ -53,9 +53,10 @@ static constexpr Rect done{67,183,106,36};
 static constexpr Rect slider{30,98,180,58};
 static constexpr int slider_left = 45;
 static constexpr int slider_right = 195;
-static constexpr Rect timeout{42,62,156,39};
-static constexpr Rect sync{42,108,156,39};
-static constexpr Rect manual{42,154,156,39};
+static constexpr Rect timeout{42,58,156,31};
+static constexpr Rect ble_advertising{42,94,156,31};
+static constexpr Rect sync{42,130,156,31};
+static constexpr Rect manual{42,166,156,31};
 static constexpr Rect year{24,55,74,66};
 static constexpr Rect month{101,55,54,66};
 static constexpr Rect day{158,55,54,66};
@@ -72,7 +73,7 @@ inline bool inScreen(int x, int y) {
 
 enum class Hit {
   None, Airplane, Vibration, Motion, Brightness, More, Back, Done, Slider,
-  Timeout, Sync, Manual, Year, Month, Day, Hour, Minute, Minus, Plus
+  Timeout, BleAdvertising, Sync, Manual, Year, Month, Day, Hour, Minute, Minus, Plus
 };
 
 inline Hit hitTest(SettingsPage page, int x, int y) {
@@ -91,6 +92,7 @@ inline Hit hitTest(SettingsPage page, int x, int y) {
     if (done.contains(x,y)) return Hit::Done;
   } else if (page == SettingsPage::More) {
     if (timeout.contains(x,y)) return Hit::Timeout;
+    if (ble_advertising.contains(x,y)) return Hit::BleAdvertising;
     if (sync.contains(x,y)) return Hit::Sync;
     if (manual.contains(x,y)) return Hit::Manual;
   } else {
@@ -257,6 +259,8 @@ class SettingsMenu {
         } else page_ = SettingsPage::Quick;
         break;
       case Hit::Timeout: return SettingsEvent(SettingsAction::NextTimeout, 0, true);
+      case Hit::BleAdvertising:
+        return SettingsEvent(SettingsAction::ToggleBleAdvertising, 0, true);
       case Hit::Sync:
         return SettingsEvent(data.sync_available ? SettingsAction::SyncTime : SettingsAction::None,
                              0, true);

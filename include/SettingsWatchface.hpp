@@ -182,10 +182,12 @@ inline void drawSettingsMenu(LGFX_Sprite& canvas, const SettingsMenu& menu,
       canvas.drawString("More",145,37);
       std::snprintf(text,sizeof(text),"Screen: %u sec",unsigned(data.values.timeout_seconds));
       menuButton(canvas,timeout,text,gray,black);
+      std::snprintf(text,sizeof(text),"BLE advertising: %s",data.values.ble_advertising ? "On" : "Off");
+      menuButton(canvas,ble_advertising,text,data.values.ble_advertising ? accent : gray,black);
       menuButton(canvas,sync,"Sync time now",data.sync_available ? accent : dark,black);
       menuButton(canvas,manual,"Set date / time",gray,black);
       canvas.setTextColor(gray,black);
-      if (data.sync_status) canvas.drawString(data.sync_status,120,204);
+      if (data.sync_status) canvas.drawString(data.sync_status,120,206);
       if (data.has_synced) {
         if (data.last_sync_age_s < 60) std::snprintf(text,sizeof(text),"Last sync: %lus",static_cast<unsigned long>(data.last_sync_age_s));
         else if (data.last_sync_age_s < 3600) std::snprintf(text,sizeof(text),"Last sync: %lum",static_cast<unsigned long>(data.last_sync_age_s / 60));
@@ -193,7 +195,7 @@ inline void drawSettingsMenu(LGFX_Sprite& canvas, const SettingsMenu& menu,
         else if (data.last_sync_age_s < 86400000U) std::snprintf(text,sizeof(text),"Last sync: %lud",static_cast<unsigned long>(data.last_sync_age_s / 86400));
         else std::snprintf(text,sizeof(text),"Last sync: >999d");
       } else std::snprintf(text,sizeof(text),"Not synced");
-      canvas.drawString(text,120,222);
+      canvas.drawString(text,120,224);
     } else {
       const bool date_page = menu.page() == SettingsPage::Date;
       canvas.drawString(date_page ? "Set date" : "Set time",145,37);
@@ -234,8 +236,10 @@ inline void drawSettingsMenu(LGFX_Sprite& canvas, const SettingsMenu& menu,
     }
   }
   // A small upward chevron is a reminder of the dismissal gesture.
-  canvas.drawLine(114,231,120,227,gray);
-  canvas.drawLine(120,227,126,231,gray);
+  if (menu.page() != SettingsPage::More) {
+    canvas.drawLine(114,231,120,227,gray);
+    canvas.drawLine(120,227,126,231,gray);
+  }
   canvas.setFont(previous_font);
   canvas.setTextStyle(previous_style);
 }

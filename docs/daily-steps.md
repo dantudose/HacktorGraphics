@@ -19,8 +19,12 @@ from those steps using the existing fixed stride estimate, so the displayed
 distance survives a reset with its step total.
 
 [BLE activity inspection](ble-activity.md) exposes today's cached steps and
-estimated distance as read-only characteristics for nRF Connect while the screen
-is awake. It does not transfer historical records or force a flash checkpoint.
+estimated distance as read-only characteristics for nRF Connect when its saved
+advertising toggle is On. Three-second discovery windows run every five seconds,
+independently of the screen, with phone sessions bounded to 30 seconds. It does
+not transfer historical records, add sensor polling, or force a flash checkpoint.
+Dark reads can retain the last known total until the next 30-minute checkpoint
+or a normal visible wake; reading BLE itself does not refresh the sensor.
 
 `StepCheckpoint` schedules a sensor snapshot every **30 minutes**, both awake
 and asleep. After sampling, firmware writes only if the dated totals or history

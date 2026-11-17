@@ -6,6 +6,7 @@ namespace watch {
 
 struct WatchSettings {
   bool airplane = false;
+  bool ble_advertising = true;
   bool vibration = true;
   bool motion_wake = true;
   uint8_t brightness = 100;
@@ -23,6 +24,7 @@ inline WatchSettings sanitizeSettings(WatchSettings value) {
 
 inline bool operator==(const WatchSettings& a, const WatchSettings& b) {
   return a.airplane == b.airplane && a.vibration == b.vibration &&
+      a.ble_advertising == b.ble_advertising &&
       a.motion_wake == b.motion_wake && a.brightness == b.brightness &&
       a.timeout_seconds == b.timeout_seconds;
 }

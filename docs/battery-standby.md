@@ -21,19 +21,29 @@ rendering is confined to that visible interaction; timer/haptic tasks continue b
 display sleep cancels the animation. Battery impact needs measurement on hardware.
 
 [Quick settings](settings.md) provide brightness (0–100 mapped to 10–100% PWM),
-5/10/15/30-second timeout, airplane mode, vibration and motion wake preferences.
+5/10/15/30-second timeout, airplane mode, vibration, motion wake, and BLE
+advertising preferences.
 They save only committed changes and add no standby polling. Airplane mode
 suppresses BLE work and its sleep deadlines; motion wake off preserves steps
 and button wake. Vibration off mutes alerts without stopping the countdown.
 The long-press debug screen shows screen-on time, successful light sleep and
 screen wake counts to help measure normal use.
-[BLE activity inspection](ble-activity.md) advertises as `HacktorWatch` while
-the screen is awake, exposing readable daily steps and estimated distance.
-Screen timeout stops advertising and disconnects the phone before processor
-light sleep. BLE reads do not extend the screen deadline. The one-second
-advertising interval and read-only values limit extra work, but advertising,
-connections, and setup/teardown still add screen-on energy use; measure their
-effect on battery life.
+[BLE activity inspection](ble-activity.md) advertises as `HacktorWatch` when
+Settings → More → BLE advertising is On, exposing readable daily steps and
+estimated distance. The preference defaults to On and survives reset. It starts
+a three-second discovery window every five seconds, with 250 ms advertising
+intervals inside that window. A phone connection can extend the cycle for up to
+30 seconds from the first observed connection before automatic disconnection.
+Screen timeout does not control this schedule. BLE reads do not extend the
+screen deadline. This precompiled SDK disables automatic power management and
+Bluetooth modem sleep, so the processor remains awake while BLE is running.
+The host/controller shut down between windows to permit light sleep. With no
+phone, discovery adds about three awake seconds per five-second cycle plus
+setup/teardown, leaving roughly two seconds for light sleep minus that overhead.
+This increases battery load compared with one window per minute;
+an explicit manual CTS attempt can extend an overlapping window until the main
+loop resumes. Automatic CTS runs between windows.
+Measure its battery impact. Turning the toggle Off removes discovery wakes.
 The settings panel also follows vertical finger drags using the same canvas.
 Stationary previews do not redraw, and opening/closing settle through the main
 loop so scheduled services continue. Sleep cancels the panel motion normally.
@@ -98,7 +108,8 @@ Q1's orientation.
 
 ## Processor standby and timekeeping
 
-While dark, the app stops rendering and enters ESP32-S3 light sleep with button
+Between BLE discovery windows/sessions and CTS work, the dark app stops
+rendering and enters ESP32-S3 light sleep with button
 GPIO0 (LOW), IMU GPIO17 and GPIO14 (HIGH), and a timer wake for scheduled work.
 The timer wakes at least once every 60 seconds to check for a USB host. USB host
 connection skips processor sleep so the serial console and firmware upload
@@ -110,13 +121,18 @@ standby does not read I2C or briefly power the rail for a battery check. The
 midnight step baseline and 30-minute checkpoints are separate scheduled sensor
 reads. BLE CTS
 synchronization remains hourly after a successful sync, with at least five
-minutes between failed attempts. BLE is stopped and its objects released after
-each attempt; synchronization can run with `3V3_2` off and I2C parked.
-The activity peripheral and CTS client share the BLE stack. Scheduled CTS waits
-until peripheral shutdown completes; manual time sync stops the peripheral
-first. Step inspection reads the latest cached visible total without I²C,
-flash writes, notifications, or additional dark sensor polling. Timer-only and
-step-checkpoint wakes do not start activity advertising.
+minutes between failed attempts. Automatic attempts run between activity
+windows and use a temporary stack that is stopped afterward. An explicit
+manual attempt can reuse an unconnected activity stack and release only its
+own client, with the window deadline applied when the main loop resumes.
+Synchronization can run with `3V3_2` off and I2C parked.
+The advertising preference does not disable CTS. Both share one BLE connection
+slot, so CTS waits while a phone is attached or the peripheral is shutting down.
+The slot is checked again after a manual scan in case a phone joined during
+it. Step inspection reads the latest cached total
+without I²C, flash writes, notifications, or additional dark sensor polling.
+While dark, that total may lag until the next 30-minute checkpoint or a normal
+screen wake.
 Scheduled scans are deferred while a button gesture or screen transition is
 pending, so they do not delay that action before its first frame.
 Scans also wait while a countdown is running, any watchface is lit, or a
@@ -126,7 +142,7 @@ sleep when a CTS retry is overdue but deferred for a running countdown.
 The five minutes before midnight also defer blocking sync, with sleep capped
 by the daily step deadline rather than an overdue scan.
 
-The motor plays two finite three-click hardware batches; the processor may sleep
+The motor plays two finite three-click hardware batches; while the BLE radio is off the processor may sleep
 between its 25 ms status polls and launches the second batch once. There is a
 3,000 ms watchdog for the whole alert, followed by 200 ms of
 settling and rail cleanup. Motion wake is temporarily excluded during this
@@ -200,9 +216,17 @@ blocking display initialization, held-at-boot suppression, and timer rollover.
    unchanged dated totals skip flash writes. Test midnight followed by a
    checkpoint/reset; use [daily-step validation](daily-steps.md#validation) for
    retention and failure cases.
+9. Test the saved BLE advertising toggle with the screen asleep: On starts
+   three-second discovery windows every five seconds, with bounded 30-second phone
+   sessions and light sleep between cycles. Off disconnects and removes these
+   discovery wakes. Confirm CTS still works with advertising Off and waits while
+   a phone is connected when it is On. Follow the full
+   [BLE validation checklist](ble-activity.md#hardware-validation).
 
 Measure battery-side current in stationary standby, with the face lit, during
 BLE synchronization, timer vibration, step checkpoints, and during normal wear.
+Compare advertising On and Off separately, connected and disconnected; include
+the default On mode's discovery wake frequency and connection-session time.
 Include expected alert frequency and two step snapshots per hour in the average.
 For the 250 mAh battery, 12 hours
 allows an ideal average of 20.8 mA; aim for 16–17 mA to leave usable-capacity
@@ -211,6 +235,7 @@ the glow, wake recovery, standby current, and 12-hour battery life still require
 watch measurements.
 
 References: [ESP-IDF light sleep](https://docs.espressif.com/projects/esp-idf/en/v5.1.4/esp32s3/api-reference/system/sleep_modes.html),
+[ESP-IDF power management](https://docs.espressif.com/projects/esp-idf/en/v5.1.4/esp32s3/api-reference/system/power_management.html),
 [ESP timer during light sleep](https://docs.espressif.com/projects/esp-idf/en/v5.1.4/esp32s3/api-reference/system/esp_timer.html#esp-timer-during-light-sleep),
 [LSM6DSL datasheet](https://www.st.com/resource/en/datasheet/lsm6dsl.pdf),
 [TI DRV2605 datasheet](https://www.ti.com/lit/ds/symlink/drv2605.pdf),

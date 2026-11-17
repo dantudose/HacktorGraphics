@@ -10,6 +10,7 @@ template <typename Store>
 WatchSettings loadSettings(Store& prefs) {
   WatchSettings value;
   value.airplane = prefs.getBool("airplane", false);
+  value.ble_advertising = prefs.getBool("bleadvert", true);
   value.vibration = prefs.getBool("vibration", true);
   value.motion_wake = prefs.getBool("motionwake", true);
   value.brightness = prefs.getUChar("brightness", 100);
@@ -25,6 +26,8 @@ bool saveSettings(Store& prefs, const WatchSettings& value,
   bool ok = true;
   if (value.airplane != last_saved.airplane)
     ok &= prefs.putBool("airplane", value.airplane) == 1;
+  if (value.ble_advertising != last_saved.ble_advertising)
+    ok &= prefs.putBool("bleadvert", value.ble_advertising) == 1;
   if (value.vibration != last_saved.vibration)
     ok &= prefs.putBool("vibration", value.vibration) == 1;
   if (value.motion_wake != last_saved.motion_wake)
