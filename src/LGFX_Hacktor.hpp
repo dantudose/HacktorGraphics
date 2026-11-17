@@ -6,11 +6,14 @@ class LGFX_Hacktor : public lgfx::LGFX_Device {
   lgfx::Bus_SPI      _bus;
 
 public:
-  LGFX_Hacktor() {
-    // --- Update to your wiring ---
-    const int8_t PIN_SCLK = 12, PIN_MOSI = 11, PIN_MISO = -1;
-    const int8_t PIN_CS   = 4, PIN_DC   = 5, PIN_RST  = 3;
+  static constexpr int8_t PIN_SCLK = 12;
+  static constexpr int8_t PIN_MOSI = 11;
+  static constexpr int8_t PIN_MISO = -1;
+  static constexpr int8_t PIN_CS = 4;
+  static constexpr int8_t PIN_DC = 5;
+  static constexpr int8_t PIN_RST = 3;
 
+  LGFX_Hacktor() {
     auto bcfg = _bus.config();
     bcfg.spi_host   = SPI3_HOST;       // ESP32-S3
     bcfg.spi_mode   = 0;
