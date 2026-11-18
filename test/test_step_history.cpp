@@ -46,6 +46,8 @@ watch::StepHistorySnapshot exampleSnapshot() {
   snapshot.history.upsert(739937, UINT32_MAX);
   snapshot.checkpoint_day = 739937;
   snapshot.checkpoint_second = 17 * 3600 + 23 * 60 + 45;
+  snapshot.raw_steps = 0xa17b;
+  snapshot.has_raw_steps = true;
   return snapshot;
 }
 
@@ -58,6 +60,23 @@ std::vector<uint8_t> encoded(const watch::StepHistorySnapshot& snapshot) {
 void fixChecksum(std::vector<uint8_t>& bytes) {
   using namespace watch::step_history_detail;
   write32(bytes.data() + bytes.size() - 4, crc32(bytes.data(), bytes.size() - 4));
+}
+
+// Frozen v1 layout: one record for day42, 1234steps, checkpoint at01:00:00.
+// The CRC is a fixture constant, so migration does not depend on the v2 encoder.
+std::vector<uint8_t> legacyFixture() {
+  std::vector<uint8_t> bytes(watch::kStepHistoryLegacyBlobSize, 0);
+  bytes[0] = 'H'; bytes[1] = 'S'; bytes[2] = 'T'; bytes[3] = 'P';
+  bytes[4] = 1;
+  bytes[6] = 15;
+  bytes[8] = 1;
+  bytes[12] = 42;
+  bytes[16] = 0x10; bytes[17] = 0x0e;
+  bytes[20] = 42;
+  bytes[24] = 0xd2; bytes[25] = 0x04;
+  bytes[140] = 0xbd; bytes[141] = 0x1c;
+  bytes[142] = 0x7f; bytes[143] = 0xdb;
+  return bytes;
 }
 
 void rejectsWithoutMutation(const std::vector<uint8_t>& bytes) {
@@ -152,7 +171,7 @@ void snapshotRoundTripsWithoutFlashWritesDuringLoad() {
   const auto original = exampleSnapshot();
   assert(watch::saveStepHistory(store, original));
   assert(store.writes == 1 && store.blobs.size() == 1);
-  assert(store.getBytesLength(watch::stepHistoryKey()) == 144);
+  assert(store.getBytesLength(watch::stepHistoryKey()) == 148);
   watch::StepHistorySnapshot reloaded;
   assert(watch::loadStepHistory(store, reloaded));
   assert(reloaded == original && store.writes == 1);
@@ -179,9 +198,74 @@ void encodingIsDeterministicAndIndependentOfObjectPadding() {
   b.history.upsert(739936, 0);
   assert(encoded(a) == encoded(b));
   const auto bytes = encoded(a);
-  assert(bytes[0] == 'H' && bytes[4] == 1 && bytes[5] == 0);
-  for (size_t i = 20 + a.history.size() * 8; i < bytes.size() - 4; ++i)
+  assert(bytes[0] == 'H' && bytes[4] == 2 && bytes[5] == 0);
+  assert(bytes[20] == 0x7b && bytes[21] == 0xa1);
+  assert(bytes[22] == 1 && bytes[23] == 0);
+  for (size_t i = 24 + a.history.size() * 8; i < bytes.size() - 4; ++i)
     assert(bytes[i] == 0);
+}
+
+void legacyVersionOneLoadsWithoutInventingARawAnchorOrWriting() {
+  TestStore store;
+  store.blobs[watch::stepHistoryKey()] = legacyFixture();
+  auto loaded = exampleSnapshot(); // Existing live raw anchor must be cleared.
+  assert(watch::loadStepHistory(store, loaded));
+  assert(loaded.history.size() == 1 && loaded.history.count(42) == 1234);
+  assert(loaded.checkpoint_day == 42 && loaded.checkpoint_second == 3600);
+  assert(!loaded.has_raw_steps && loaded.raw_steps == 0);
+  assert(store.writes == 0);
+  assert(store.blobs.at(watch::stepHistoryKey()) == legacyFixture());
+  assert(watch::saveStepHistory(store, loaded));
+  assert(store.writes == 1 && store.getBytesLength(watch::stepHistoryKey()) == 148);
+  assert(store.blobs.at(watch::stepHistoryKey())[4] == 2);
+  watch::StepHistorySnapshot migrated;
+  assert(watch::loadStepHistory(store, migrated) && migrated == loaded);
+}
+
+void rawCounterZeroAndMaximumAreBothValidAnchors() {
+  for (uint16_t raw : {uint16_t(0), uint16_t(0xffff)}) {
+    auto snapshot = exampleSnapshot();
+    snapshot.raw_steps = raw;
+    const auto bytes = encoded(snapshot);
+    watch::StepHistorySnapshot decoded;
+    assert(watch::decodeStepHistory(bytes.data(), bytes.size(), decoded));
+    assert(decoded == snapshot && decoded.has_raw_steps && decoded.raw_steps == raw);
+  }
+  auto absent = exampleSnapshot();
+  absent.has_raw_steps = false;
+  absent.raw_steps = 0;
+  const auto bytes = encoded(absent);
+  watch::StepHistorySnapshot decoded;
+  assert(watch::decodeStepHistory(bytes.data(), bytes.size(), decoded));
+  assert(decoded == absent && !decoded.has_raw_steps);
+}
+
+void snapshotEqualityIncludesTheRawAnchor() {
+  const auto original = exampleSnapshot();
+  auto changed = original;
+  changed.raw_steps ^= 1;
+  assert(changed != original);
+  changed = original;
+  changed.has_raw_steps = false;
+  assert(changed != original);
+}
+
+void invalidRawFlagsReservedBytesAndNoncanonicalAnchorsAreRejected() {
+  const auto original = encoded(exampleSnapshot());
+  for (size_t offset : {size_t(22), size_t(23)}) {
+    auto damaged = original;
+    damaged[offset] |= 2;
+    fixChecksum(damaged);
+    rejectsWithoutMutation(damaged);
+  }
+  auto missing_flag = original;
+  missing_flag[22] = 0; // A nonzero raw counter without a valid flag is ambiguous.
+  fixChecksum(missing_flag);
+  rejectsWithoutMutation(missing_flag);
+  TestStore store;
+  auto noncanonical = exampleSnapshot();
+  noncanonical.has_raw_steps = false;
+  assert(!watch::saveStepHistory(store, noncanonical) && store.writes == 0);
 }
 
 void emptyOrInvalidClockSnapshotsAreNeverWritten() {
@@ -255,12 +339,12 @@ void invalidDuplicateUnsortedAndStaleRecordsAreRejected() {
   const auto original = encoded(exampleSnapshot());
   for (uint32_t day : {739936U, 739938U, 3652059U, UINT32_MAX, 739000U}) {
     auto damaged = original;
-    watch::step_history_detail::write32(damaged.data() + 20, day);
+    watch::step_history_detail::write32(damaged.data() + 24, day);
     fixChecksum(damaged);
     rejectsWithoutMutation(damaged);
   }
   auto unused = original;
-  unused[20 + 3 * 8] = 1;
+  unused[24 + 3 * 8] = 1;
   fixChecksum(unused);
   rejectsWithoutMutation(unused);
 }
@@ -318,6 +402,10 @@ int main() {
   snapshotRoundTripsWithoutFlashWritesDuringLoad();
   fullHistoryRoundTripsEveryDateAndCount();
   encodingIsDeterministicAndIndependentOfObjectPadding();
+  legacyVersionOneLoadsWithoutInventingARawAnchorOrWriting();
+  rawCounterZeroAndMaximumAreBothValidAnchors();
+  snapshotEqualityIncludesTheRawAnchor();
+  invalidRawFlagsReservedBytesAndNoncanonicalAnchorsAreRejected();
   emptyOrInvalidClockSnapshotsAreNeverWritten();
   missingOrShortReadsPreserveLiveState();
   everySingleBitCorruptionFailsIntegrityCheck();
@@ -327,5 +415,5 @@ int main() {
   failedSavePreservesOldSnapshotAndCanBeRetried();
   partialWriteIsReportedAndTruncatedBlobIsRejected();
   wrongBufferSizesAndNullPointersAreRejected();
-  std::puts("Step history: all 19 scenarios passed.");
+  std::puts("Step history: all 23 scenarios passed.");
 }

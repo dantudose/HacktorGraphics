@@ -58,11 +58,19 @@ minutes, including in standby. The LCD stays asleep; brief backlight glow can
 occur while the shared rail is restored. Midnight closes the
 outgoing date's total and starts the new date. Periodic checkpoints save changed
 dated totals to ESP32 NVS so steps and estimated distance survive resets, with
-today and the previous 14 dates retained. Unchanged totals skip flash writes;
-step history attempts at most 48 saves per day, starting 30 minutes after boot.
-There is no per-second standby step polling. Abrupt reset normally loses at
-most the last 30 minutes, with failed reads/writes or service delays extending
-that window.
+today and the previous 14 dates retained. A verified warm reset reads the
+still-running IMU before flash restoration, then combines its raw counter with
+the saved daily reference to recover unsaved activity without another sensor
+reset or forced history write. Cold setup, legacy migration, and changed-day
+baselines each save a new raw anchor once; ordinary changed totals still save
+at 30-minute checkpoints. Thus the 48-per-day limit applies to ordinary
+periodic attempts, with additional anchor saves and bounded retries.
+There is no per-second standby step polling. Sensor power loss or unverified
+continuity falls back to saved totals and a fresh baseline; that fallback can
+lose the last 30 minutes, with failed reads/writes or service delays extending
+the window. Version-1 history has no raw anchor to recover pre-upgrade unsaved
+activity. See [daily-step recovery](daily-steps.md) for the committed-anchor
+marker, failure cadence, and counter-wrap limits.
 
 ## Backlight rail workaround
 

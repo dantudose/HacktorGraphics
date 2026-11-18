@@ -74,6 +74,16 @@ class DailySteps {
     needs_baseline_ = true;
   }
 
+  // Resume a verified continuing sensor epoch. Unlike restoreCount(), the
+  // supplied raw anchor belongs to this total, so the next sample adds its
+  // actual delta instead of discarding steps taken during processor reboot.
+  void restoreCountAndRaw(uint32_t count, uint16_t raw) {
+    if (!has_day_) return;
+    count_ = count;
+    last_raw_ = raw;
+    needs_baseline_ = false;
+  }
+
   void sample(uint16_t raw) {
     if (!has_day_) return;
     if (needs_baseline_) {
@@ -88,6 +98,7 @@ class DailySteps {
   }
 
   uint32_t count() const { return count_; }
+  uint16_t lastRaw() const { return last_raw_; } // Valid after a baseline.
   int32_t dayKey() const { return day_key_; } // Valid only when hasDay().
   bool needsBaseline() const { return needs_baseline_; }
   bool hasDay() const { return has_day_; }

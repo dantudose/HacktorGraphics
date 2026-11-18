@@ -64,6 +64,11 @@ The estimate uses the same 747 mm per step as the watchface. A step is one
 footfall. These are today's totals, not a transfer of the stored two-week
 history. The [daily step rules](daily-steps.md), midnight reset, clock
 corrections, and flash restoration apply to both values.
+A verified warm reboot first reads the running IMU and recovers unsaved steps
+from the persisted raw-counter reference; BLE then exposes that recovered
+total. Sensor power loss or unverified continuity uses the saved-total fallback
+and a fresh baseline instead, so the newest unsaved activity can be lost.
+Legacy version-1 history needs one new anchor before warm recovery is available.
 
 Reads use the latest cached daily total. They do not initiate an IMU read or a
 flash save. The main loop refreshes that cache through the existing visible
@@ -152,8 +157,11 @@ emulate the controller or measure battery current.
 
 ## Hardware validation
 
-- Compare both readable values with the watchface, including after a flash
-  checkpoint/reset and after walking while asleep followed by a normal wake.
+- Compare both readable values with the watchface after walking while asleep
+  followed by a normal wake. After the initial raw anchor is saved, reset the
+  CPU before the first 30-minute checkpoint and verify unsaved steps/distance
+  recover on BLE as well. Repeat after a checkpoint, then test sensor-power-loss
+  fallback separately; it can restore only the saved total.
 - Scan across several cycles with the screen both awake and asleep. Verify one
   three-second discovery window every five seconds and light sleep between
   windows.

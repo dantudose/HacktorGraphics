@@ -27,6 +27,7 @@
 #include "StepCheckpoint.hpp"
 #include "StepCounterRead.hpp"
 #include "Lsm6dslPedometer.hpp"
+#include "Lsm6dslStartup.hpp"
 #include "ImuReset.hpp"
 #include "WatchSettings.hpp"
 #include "WatchSettingsStore.hpp"
@@ -127,6 +128,10 @@ static bool step_clock_ready = false;
 static bool step_baseline_attempted = false;
 static uint32_t last_step_baseline_attempt_ms = 0;
 static constexpr uint32_t STEP_BASELINE_RETRY_MS = 60000;
+static bool step_anchor_trusted = false;
+static bool step_anchor_attempted = false;
+static uint32_t last_step_anchor_attempt_ms = 0;
+static bool step_persistence_ready = false;
 // BLE's synchronous connection retries can take over a minute. Leave a wide
 // window before midnight; scheduled sync resumes after the boundary snapshot.
 static constexpr uint32_t STEP_CTS_GUARD_MS = 300000;
@@ -398,6 +403,19 @@ static bool readStepCounter(uint16_t& steps) {
   return ok;
 }
 
+// BDU affects unused accelerometer/gyro output latching, not step counting.
+// Keep it clear until the current daily/raw anchor is durable. A reset during
+// an uncommitted cold setup must never pair a new sensor epoch with old flash.
+// This marker relies on the current no-FIFO configuration (FIFO requires BDU).
+static bool setStepAnchorTrusted(bool trusted) {
+  const uint8_t control = trusted ? 0x44 : 0x04;
+  uint8_t actual = 0;
+  const bool ok = i2c_ready && imuWriteRegister(0x12, control) &&
+      imuReadRegister(0x12, actual) && actual == control;
+  step_anchor_trusted = ok && trusted;
+  return ok;
+}
+
 #if HACKTOR_LOG_LEVEL >= WATCH_LOG_LEVEL_DEBUG
 static void dumpPedometerConfig() {
   // Stay in the current bank: a failed bank restore must be visible in the
@@ -442,13 +460,26 @@ static int32_t currentStepDay(uint64_t now_us) {
   return day > watch::StepHistory::kLastCivilDay ? watch::StepHistory::kLastCivilDay : day;
 }
 
+static void prepareStepDate(int32_t day) {
+  if (daily_steps.hasDay() && daily_steps.dayKey() == day) return;
+  step_anchor_attempted = false;
+  if (step_anchor_trusted && !setStepAnchorTrusted(false))
+    WATCH_LOG_W("Step anchor could not be marked pending");
+}
+
 static uint32_t nextDailyStepWaitMs(uint32_t now_ms, uint64_t now_us) {
   if (!step_clock_ready) return MAX_STANDBY_SLEEP_MS;
   // Panel shutdown can itself cross midnight after the last service call.
   // Let the service close the old day with a raw snapshot before changing it.
   if (!daily_steps.hasDay() || daily_steps.dayKey() != currentStepDay(now_us)) return 0;
-  const uint32_t wait = std::min(step_checkpoint.waitMs(now_ms),
+  uint32_t wait = std::min(step_checkpoint.waitMs(now_ms),
       watch::millisUntilMidnight(watch_clock.at(now_us)));
+  if (step_persistence_ready && daily_steps.needsAnchorSave()) {
+    const uint32_t anchor_wait = step_anchor_attempted
+        ? watch::remainingMs(now_ms, last_step_anchor_attempt_ms, STEP_BASELINE_RETRY_MS)
+        : 0;
+    wait = std::min(wait, anchor_wait);
+  }
   if (!pedometer_enabled || !daily_steps.needsBaseline()) return wait;
   const uint32_t retry_wait = step_baseline_attempted
       ? watch::remainingMs(now_ms, last_step_baseline_attempt_ms, STEP_BASELINE_RETRY_MS)
@@ -663,7 +694,8 @@ static void i2cScan() {
 }
 #endif
 
-static bool initImuWakeGesture() {
+static bool initImuWakeGesture(bool& counter_retained, uint16_t& retained_raw) {
+  counter_retained = false;
   uint8_t whoami = 0;
   WATCH_LOG_D("IMU init start");
 
@@ -689,10 +721,21 @@ static bool initImuWakeGesture() {
     return false;
   }
 
-  // The IMU stays powered through CPU resets/uploads. Reset its configuration
-  // once at startup so stale routes, thresholds or reserved-bit writes from an
-  // older firmware cannot keep the embedded step detector stalled. The daily
-  // software baseline is captured only after this initialization finishes.
+  // Read before flash restoration or destructive setup. A CPU/USB reset can
+  // leave the IMU counting; a verified running configuration and committed
+  // anchor marker let us preserve its counter and recover the unsaved delta.
+  if (watch::lsm6dslRunning(imuReadRegister, IMU_WAKE_THRESHOLD) &&
+      readStepCounter(retained_raw)) {
+    counter_retained = true;
+    step_anchor_trusted = true;
+    pedometer_enabled = true;
+    clearImuInterruptSource();
+    WATCH_LOG_I("Retaining running IMU: raw=%u", static_cast<unsigned>(retained_raw));
+    return true;
+  }
+
+  // Cold/unverified sensors retain the known-good reset/configuration path.
+  // Keep the BDU anchor marker clear until a new raw baseline is saved.
   // AN5040's reset sequence requires gyro power-down and accel high performance.
   if (!imuWriteRegister(0x11, 0x00) || // CTRL2_G: gyro power-down.
       !imuWriteRegister(0x15, 0x00) || // CTRL6_C: XL_HM_MODE = 0.
@@ -711,7 +754,7 @@ static bool initImuWakeGesture() {
   }
 
   bool ok = true;
-  ok &= imuWriteRegister(0x12, 0x44); // CTRL3_C: BDU = 1, IF_INC = 1
+  ok &= imuWriteRegister(0x12, 0x04); // CTRL3_C: IF_INC = 1, anchor uncommitted.
   enablePedometer(); // Best effort, with accel/gyro still in power-down.
   // Ensure later writes cannot accidentally target an embedded register bank.
   if (!imuWriteRegister(0x01, 0x00)) return false;
@@ -728,7 +771,7 @@ static bool initImuWakeGesture() {
 
   uint8_t ctrl1 = 0, ctrl3 = 0;
   ok &= imuReadRegister(0x10, ctrl1) && ctrl1 == 0x40;
-  ok &= imuReadRegister(0x12, ctrl3) && (ctrl3 & 0x44) == 0x44;
+  ok &= imuReadRegister(0x12, ctrl3) && ctrl3 == 0x04;
   if (!ok) {
     WATCH_LOG_E("IMU register write failed");
     return false;
@@ -892,7 +935,10 @@ static void serviceDailySteps(uint32_t now_ms) {
   const bool baseline_due = pedometer_enabled && daily_steps.needsBaseline() &&
       (!step_baseline_attempted || !watch::remainingMs(
           now_ms, last_step_baseline_attempt_ms, STEP_BASELINE_RETRY_MS));
-  if (!day_changed && !checkpoint_due && !baseline_due) return;
+  const bool anchor_due = step_persistence_ready && daily_steps.needsAnchorSave() &&
+      (!step_anchor_attempted || !watch::remainingMs(
+          now_ms, last_step_anchor_attempt_ms, STEP_BASELINE_RETRY_MS));
+  if (!day_changed && !checkpoint_due && !baseline_due && !anchor_due) return;
 
   bool sampled = false;
   if (pedometer_enabled) {
@@ -900,8 +946,12 @@ static void serviceDailySteps(uint32_t now_ms) {
     last_step_baseline_attempt_ms = now_ms;
     uint16_t raw = 0;
     // Sample even when RAM is clean: the IMU counts while the screen is asleep.
-    if (preparePeripheralServicePower() && readStepCounter(raw)) {
+    if (preparePeripheralServicePower()) {
+      prepareStepDate(currentStepDay(esp_timer_get_time()));
+    }
+    if (i2c_ready && readStepCounter(raw)) {
       sample_time_us = esp_timer_get_time();
+      prepareStepDate(currentStepDay(sample_time_us));
       daily_steps.sample(currentStepDay(sample_time_us), raw);
       sampled = true;
     } else {
@@ -912,17 +962,29 @@ static void serviceDailySteps(uint32_t now_ms) {
     sample_time_us = esp_timer_get_time();
     // On a failed boundary read, preserve the known old total and show the new
     // date's restored total immediately. Its baseline retries once per minute.
+    prepareStepDate(currentStepDay(sample_time_us));
     daily_steps.observeDay(currentStepDay(sample_time_us));
   }
   publishDailySteps();
 
-  if (checkpoint_due) {
-    // Unchanged totals and failed writes also consume this deadline. No retry
-    // burst, boot write, or clock adjustment can bypass the 30-minute interval.
-    step_checkpoint.attempted(lgfx::millis());
+  const bool save_anchor = step_persistence_ready && daily_steps.needsAnchorSave() &&
+      (!step_anchor_attempted || !watch::remainingMs(
+          now_ms, last_step_anchor_attempt_ms, STEP_BASELINE_RETRY_MS));
+  if (checkpoint_due || save_anchor) {
+    // Regular totals stay on the 30-minute schedule. A cold/new-date baseline
+    // needs one durable raw anchor first; failed anchor commits retry slowly.
+    const uint32_t attempt_ms = lgfx::millis();
+    step_checkpoint.attempted(attempt_ms);
     const uint32_t second = watch_clock.at(sample_time_us) / 1000ULL % 86400ULL;
-    if (!daily_steps.save(prefs, second)) {
-      WATCH_LOG_W("Step history save failed; retrying at the next checkpoint");
+    if (save_anchor) {
+      step_anchor_attempted = true;
+      last_step_anchor_attempt_ms = attempt_ms;
+    }
+    const bool gate_ready = !save_anchor || setStepAnchorTrusted(false);
+    if (!gate_ready || !daily_steps.save(prefs, second)) {
+      WATCH_LOG_W("Step save failed; anchor retries in one minute, totals at next checkpoint");
+    } else if (!daily_steps.needsBaseline() && !setStepAnchorTrusted(true)) {
+      WATCH_LOG_W("Step anchor saved but IMU continuity marker unavailable");
     }
   }
   if (display_sleeping && !backlight_triggered &&
@@ -2119,23 +2181,33 @@ void setup() {
   pinMode(IMU_INT2_PIN, INPUT_PULLUP);
   pinMode(PIN_BTN, INPUT_PULLUP);
   button.reset(digitalRead(PIN_BTN) == LOW, lgfx::millis());
+
+  backlight(0);
+  // Snapshot the existing counter before looking up its flash reference.
+  // Touch stays reset throughout IMU probe/setup on the shared I2C bus.
+  driveLow(TP_RST);
+  delay(30);
+  bool counter_retained = false;
+  uint16_t retained_raw = 0;
+  imu_ready = initImuWakeGesture(counter_retained, retained_raw);
+
   if (!prefs.begin("watch", false)) WATCH_LOG_W("Watch preferences unavailable");
   loadWatchSettings();
   watch::StepHistorySnapshot step_snapshot;
   const bool step_history_loaded = watch::loadStepHistory(prefs, step_snapshot);
-  if (step_history_loaded) daily_steps.restore(step_snapshot.history);
+  const bool steps_resumed = counter_retained && step_history_loaded &&
+      daily_steps.resume(step_snapshot, retained_raw);
+  if (!steps_resumed) {
+    if (step_history_loaded) daily_steps.restore(step_snapshot);
+    if (counter_retained && !setStepAnchorTrusted(false))
+      WATCH_LOG_W("Legacy step baseline could not be marked pending");
+  }
+  publishDailySteps();
   step_checkpoint.begin(lgfx::millis());
   reset_counter = prefs.getUInt("reset_count", 0);
   ++reset_counter;
   prefs.putUInt("reset_count", reset_counter);
   
-  backlight(0);
-  // Keep touch in reset while configuring the IMU on their shared I2C bus.
-  // Release it only after IMU setup, then allow the full touch startup time.
-  driveLow(TP_RST);
-  delay(30);
-
-  imu_ready = initImuWakeGesture();
   WATCH_LOG_I("IMU startup: ready=%d pedometer=%d motion_setting=%d", imu_ready,
               pedometer_enabled, watch_settings.motion_wake);
   if (imu_ready) {
@@ -2175,6 +2247,9 @@ void setup() {
     watch_clock.set(static_cast<uint64_t>(compileTimeSeconds()) * 1000ULL, esp_timer_get_time());
   }
   step_clock_ready = true;
+  // Commit a cold/migrated baseline before potentially blocking boot CTS.
+  // A later CTS date correction establishes its own dated anchor if needed.
+  step_persistence_ready = true;
   serviceDailySteps(lgfx::millis());
   if (!watch_settings.airplane && !deferCtsForStepReset()) syncTimeFromCts("boot");
   serviceDailySteps(lgfx::millis());
@@ -2292,6 +2367,7 @@ void loop() {
       (refresh_after_wake || backlight_triggered || now_ms - last_step_poll_ms >= STEP_REFRESH_MS)) {
     uint16_t steps = 0;
     if (readStepCounter(steps)) {
+      prepareStepDate(currentStepDay(esp_timer_get_time()));
       daily_steps.sample(currentStepDay(esp_timer_get_time()), steps);
       publishDailySteps();
       WATCH_LOG_D("Steps: raw=%u daily=%lu", static_cast<unsigned>(steps),

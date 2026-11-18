@@ -84,8 +84,10 @@ When airplane mode is off, a later CTS sync can replace the manual clock value.
 A valid step-history checkpoint supplies the saved clock date/time at startup,
 with compile-time fallback only when history is missing or invalid. There is no
 persistent RTC to recover elapsed time across reset/power loss. Manual clock
-values are included only when a changed step-history checkpoint is saved;
-unchanged totals do not trigger timestamp-only writes.
+values are included when a step-history checkpoint or changed-day raw anchor
+is saved; unchanged totals do not trigger timestamp-only writes. A date change
+needs its new sensor baseline committed once so later warm resets can recover
+the correct daily count.
 
 ## Persistence and power
 
@@ -94,10 +96,15 @@ Brightness is previewed live and saved on finger release; an interrupted edit
 reverts to the last saved value. There are no repeated saves during dragging.
 Date/time editing uses a draft until Save, so leaving the editor cancels it.
 [Steps and estimated distance](daily-steps.md) use a separate 30-minute
-checkpoint, saving only changed dated totals and retaining today plus 14 earlier
-calendar dates. Clock edits do not force additional history writes. A reset
-normally loses only the most recent 30 minutes of activity; failed sensor reads,
-failed writes, or delayed service can extend that interval.
+checkpoint, saving changed dated totals/raw references and retaining today plus
+14 earlier calendar dates. A new cold/legacy/day baseline also saves its raw
+anchor once, including after a date edit or midnight. Verified warm resets read
+the running IMU before flash restoration and recover activity since the saved
+anchor; they do not force an extra save on the same date. Sensor power loss or
+unverified continuity instead restores the saved total with a fresh baseline,
+so that fallback can lose the most recent 30 minutes of activity. Failed
+sensor reads/writes or delayed service can extend that interval. Pending anchor
+saves retry at most once per minute; ordinary save failures wait 30 minutes.
 
 With Airplane mode off and BLE advertising On,
 [activity inspection](ble-activity.md) exposes read-only daily steps and

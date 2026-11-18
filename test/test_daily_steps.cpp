@@ -217,6 +217,41 @@ void restoredTotalSaturatesInsteadOfWrapping() {
   assert(steps.count() == maximum);
 }
 
+void verifiedRawRestoreRequiresADateAndAddsTheFirstDelta() {
+  watch::DailySteps steps;
+  steps.restoreCountAndRaw(2000, 1234);
+  assert(!steps.hasDay() && steps.count() == 0 && steps.needsBaseline());
+  steps.observeDay(10);
+  steps.restoreCountAndRaw(234, 1234);
+  assert(steps.count() == 234 && !steps.needsBaseline());
+  assert(steps.lastRaw() == 1234);
+  steps.sample(1260);
+  assert(steps.count() == 260 && steps.lastRaw() == 1260);
+}
+
+void verifiedRawRestoreHandlesWrapAndLaterDateChanges() {
+  watch::DailySteps steps;
+  steps.observeDay(10);
+  steps.restoreCountAndRaw(900, 65530);
+  steps.sample(3);
+  assert(steps.count() == 909 && steps.lastRaw() == 3);
+  assert(steps.observeDay(11));
+  assert(steps.count() == 0 && steps.needsBaseline());
+  steps.sample(7);
+  assert(steps.count() == 0 && steps.lastRaw() == 7);
+}
+
+void verifiedRawRestoreCanReplaceABaselineAndStillSaturates() {
+  watch::DailySteps steps;
+  steps.observeDay(1);
+  steps.sample(100);
+  steps.sample(110);
+  const uint32_t maximum = std::numeric_limits<uint32_t>::max();
+  steps.restoreCountAndRaw(maximum - 2, 2000);
+  steps.sample(2005);
+  assert(steps.count() == maximum && steps.lastRaw() == 2005);
+}
+
 void civilDatesUseAnAbsoluteGregorianOrdinal() {
   using watch::civilDayNumber;
   assert(civilDayNumber(1, 1, 1) == 0);
@@ -306,10 +341,13 @@ int main() {
   restoringAnEstablishedDayDiscardsTheOldRawBaseline();
   changingDatesStillClearsARestoredTotal();
   restoredTotalSaturatesInsteadOfWrapping();
+  verifiedRawRestoreRequiresADateAndAddsTheFirstDelta();
+  verifiedRawRestoreHandlesWrapAndLaterDateChanges();
+  verifiedRawRestoreCanReplaceABaselineAndStillSaturates();
   civilDatesUseAnAbsoluteGregorianOrdinal();
   leapAndCenturyBoundariesStayAdjacent();
   dayOrdinalsRecoverEndpointsAndLeapDates();
   civilDateRoundtripCoversTwoCenturiesOfEveryDate();
   midnightWaitUsesClockTimeIncludingElapsedDays();
-  std::puts("Daily steps: all 20 scenarios passed.");
+  std::puts("Daily steps: all 23 scenarios passed.");
 }

@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -71,11 +72,13 @@ void sameDayResetRestoresTheTotalAndTakesAFreshBaseline() {
   // like a hardware wrap and invent more than sixty thousand steps.
   restarted.sample(700, 5);
   assert(restarted.count() == 234 && !restarted.needsBaseline());
-  assert(!restarted.dirty());
+  assert(restarted.dirty() && restarted.needsAnchorSave());
+  assert(restarted.save(store, 43201)); // Commit the independently reset sensor.
+  assert(!restarted.dirty() && !restarted.needsAnchorSave());
   restarted.sample(700, 14);
   assert(restarted.count() == 243 && restarted.dirty());
   assert(restarted.save(store, 43260));
-  assert(reload(store).history.count(700) == 243 && store.writes == 2);
+  assert(reload(store).history.count(700) == 243 && store.writes == 3);
 }
 
 void unchangedTotalsDoNotWriteEvenWhenTheTimestampAdvances() {
@@ -104,6 +107,7 @@ void midnightClosesTheOldDayWithTheBoundaryRawSample() {
   steps.sample(301, 1150);
   assert(steps.dayKey() == 301 && steps.count() == 0);
   assert(!steps.needsBaseline());
+  assert(steps.needsAnchorSave());
   assert(steps.history().count(300) == 150);
   assert(steps.history().find(301));
   steps.sample(301, 1163);
@@ -112,6 +116,8 @@ void midnightClosesTheOldDayWithTheBoundaryRawSample() {
   const auto snapshot = reload(store);
   assert(snapshot.history.count(300) == 150);
   assert(snapshot.history.count(301) == 13);
+  assert(snapshot.has_raw_steps && snapshot.raw_steps == 1163);
+  assert(!steps.needsAnchorSave());
 }
 
 void failedMidnightReadPreservesTheCachedOldDayAndNeedsANewBaseline() {
@@ -123,11 +129,13 @@ void failedMidnightReadPreservesTheCachedOldDayAndNeedsANewBaseline() {
   // No raw value is submitted for the failed midnight transaction.
   assert(steps.observeDay(401));
   assert(steps.count() == 0 && steps.needsBaseline());
+  assert(!steps.needsAnchorSave());
   assert(steps.history().count(400) == 40);
   assert(!steps.observeDay(401));
   assert(steps.count() == 0 && steps.needsBaseline());
   steps.sample(401, 10);
   assert(steps.count() == 0 && !steps.needsBaseline());
+  assert(steps.needsAnchorSave());
   assert(steps.history().count(400) == 40);
   steps.sample(401, 17);
   assert(steps.count() == 7);
@@ -249,6 +257,139 @@ void invalidDatesDoNotChangeTheLiveTotalOrHistory() {
   assert(steps.count() == 11);
 }
 
+void warmResumeRecoversUnsavedStepsAndKeepsCountingDuringBoot() {
+  TestStore store;
+  watch::StepTracking steps;
+  steps.sample(700, 1000);
+  steps.sample(700, 1234);
+  assert(steps.save(store, 43200));
+  const auto snapshot = reload(store);
+  assert(snapshot.has_raw_steps && snapshot.raw_steps == 1234);
+
+  watch::StepTracking restarted;
+  assert(restarted.resume(snapshot, 1260));
+  assert(restarted.count() == 260 && restarted.dayKey() == 700);
+  assert(!restarted.needsBaseline() && !restarted.needsAnchorSave());
+  assert(restarted.dirty() && store.writes == 1);
+  restarted.sample(700, 1265); // More steps while graphics/CTS finish booting.
+  assert(restarted.count() == 265);
+
+  watch::StepTracking another_reset;
+  assert(another_reset.resume(snapshot, 1265));
+  assert(another_reset.count() == 265 && store.writes == 1);
+  assert(another_reset.save(store, 43210));
+  assert(store.writes == 2);
+  watch::StepTracking after_checkpoint;
+  assert(after_checkpoint.resume(reload(store), 1270));
+  assert(after_checkpoint.count() == 270 && !after_checkpoint.needsAnchorSave());
+}
+
+void unchangedWarmResumeNeedsNoAnchorOrFlashWrite() {
+  TestStore store;
+  watch::StepTracking steps;
+  steps.sample(10, 100);
+  steps.sample(10, 110);
+  assert(steps.save(store, 100));
+  const auto snapshot = reload(store);
+  watch::StepTracking restarted;
+  assert(restarted.resume(snapshot, 110));
+  assert(restarted.count() == 10 && !restarted.dirty());
+  assert(!restarted.needsBaseline() && !restarted.needsAnchorSave());
+  assert(restarted.save(store, 200));
+  assert(store.writes == 1);
+}
+
+void warmResumeHandlesCounterWrapAndSaturatedTotals() {
+  watch::StepHistorySnapshot snapshot;
+  snapshot.history.upsert(10, 500);
+  snapshot.checkpoint_day = 10;
+  snapshot.has_raw_steps = true;
+  snapshot.raw_steps = 65530;
+  watch::StepTracking steps;
+  assert(steps.resume(snapshot, 3));
+  assert(steps.count() == 509 && !steps.needsAnchorSave());
+  const uint32_t maximum = std::numeric_limits<uint32_t>::max();
+  snapshot.history.upsert(10, maximum - 2);
+  assert(steps.resume(snapshot, 3));
+  assert(steps.count() == maximum);
+  steps.sample(10, 4);
+  assert(steps.count() == maximum && steps.dirty());
+}
+
+void legacyResumeRejectsWithoutMutationAndCanEstablishANewAnchor() {
+  watch::StepTracking steps;
+  steps.sample(10, 100);
+  steps.sample(10, 110);
+  const auto history = steps.history();
+  watch::StepHistorySnapshot legacy;
+  legacy.history.upsert(20, 1000);
+  legacy.checkpoint_day = 20;
+  assert(!steps.resume(legacy, 120));
+  assert(steps.count() == 10 && steps.dayKey() == 10 && steps.history() == history);
+
+  steps.restore(legacy);
+  assert(!steps.hasDay() && !steps.dirty());
+  steps.observeDay(20);
+  assert(steps.count() == 1000 && steps.needsBaseline());
+  assert(!steps.needsAnchorSave());
+  steps.sample(20, 20);
+  assert(steps.needsAnchorSave() && steps.count() == 1000);
+  TestStore store;
+  assert(steps.save(store, 200));
+  const auto migrated = reload(store);
+  assert(migrated.has_raw_steps && migrated.raw_steps == 20);
+  watch::StepTracking restarted;
+  assert(restarted.resume(migrated, 25));
+  assert(restarted.count() == 1005);
+}
+
+void aColdBaselineMustSaveEvenWhenTheDailyTotalAndRawAreUnchanged() {
+  TestStore store;
+  watch::StepTracking steps;
+  steps.sample(10, 100);
+  steps.sample(10, 120);
+  assert(steps.save(store, 200));
+  const auto snapshot = reload(store);
+  steps.restore(snapshot);
+  steps.observeDay(10);
+  steps.sample(10, 120); // Coincidentally identical, but a new sensor epoch.
+  assert(steps.count() == 20 && steps.history() == snapshot.history);
+  assert(steps.dirty() && steps.needsAnchorSave());
+  assert(steps.save(store, 201));
+  assert(store.writes == 2 && !steps.dirty() && !steps.needsAnchorSave());
+}
+
+void failedInitialAnchorSaveRemainsPendingUntilDurable() {
+  TestStore store;
+  watch::StepTracking steps;
+  steps.observeDay(10);
+  assert(!steps.needsAnchorSave());
+  steps.sample(10, 250);
+  assert(steps.count() == 0 && steps.needsAnchorSave());
+  store.fail_write = true;
+  assert(!steps.save(store, 100));
+  assert(steps.dirty() && steps.needsAnchorSave() && store.blob.empty());
+  steps.sample(10, 260);
+  store.fail_write = false;
+  assert(steps.save(store, 101));
+  const auto saved = reload(store);
+  assert(saved.history.count(10) == 10 && saved.raw_steps == 260 && saved.has_raw_steps);
+  assert(!steps.dirty() && !steps.needsAnchorSave());
+}
+
+void savingWithoutABaselineDoesNotPretendToCommitARawAnchor() {
+  TestStore store;
+  watch::StepTracking steps;
+  steps.observeDay(10);
+  assert(steps.save(store, 100));
+  assert(!reload(store).has_raw_steps);
+  assert(steps.dirty() && !steps.needsAnchorSave());
+  steps.sample(10, 250);
+  assert(steps.needsAnchorSave());
+  assert(steps.save(store, 101));
+  assert(reload(store).raw_steps == 250 && !steps.dirty());
+}
+
 }  // namespace
 
 int main() {
@@ -262,5 +403,12 @@ int main() {
   failedSaveStaysDirtyAndRetriesOnlyAtTheNextCheckpoint();
   sleepingCheckpointsSampleTheSensorEvenWhenRamWasUnchanged();
   invalidDatesDoNotChangeTheLiveTotalOrHistory();
-  std::puts("Step tracking: all 10 scenarios passed.");
+  warmResumeRecoversUnsavedStepsAndKeepsCountingDuringBoot();
+  unchangedWarmResumeNeedsNoAnchorOrFlashWrite();
+  warmResumeHandlesCounterWrapAndSaturatedTotals();
+  legacyResumeRejectsWithoutMutationAndCanEstablishANewAnchor();
+  aColdBaselineMustSaveEvenWhenTheDailyTotalAndRawAreUnchanged();
+  failedInitialAnchorSaveRemainsPendingUntilDurable();
+  savingWithoutABaselineDoesNotPretendToCommitARawAnchor();
+  std::puts("Step tracking: all 17 scenarios passed.");
 }

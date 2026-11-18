@@ -5,14 +5,37 @@
 
 namespace watch {
 
-// Join sensor baselines to dated history. Raw IMU values never cross a reboot;
-// only daily totals do. All live updates stay in RAM until a checkpoint saves.
+// Join sensor baselines to dated history. A persisted raw anchor can recover
+// unsaved activity only after startup verifies the same running sensor epoch.
+// Ordinary live updates stay in RAM until the next periodic checkpoint.
 class StepTracking {
  public:
-  void restore(const StepHistory& history) {
+  void restore(const StepHistorySnapshot& snapshot) {
     daily_ = DailySteps();
-    history_ = history;
-    saved_history_ = history;
+    history_ = snapshot.history;
+    saved_history_ = snapshot.history;
+    saved_raw_ = snapshot.raw_steps;
+    saved_has_raw_ = snapshot.has_raw_steps;
+    anchor_required_ = false;
+  }
+
+  void restore(const StepHistory& history) {
+    StepHistorySnapshot snapshot;
+    snapshot.history = history;
+    restore(snapshot);
+  }
+
+  // The caller must prove that live_raw continues the saved hardware counter.
+  // A raw-less legacy snapshot cannot establish that relationship.
+  bool resume(const StepHistorySnapshot& snapshot, uint16_t live_raw) {
+    if (!snapshot.has_raw_steps ||
+        !snapshot.history.find(snapshot.checkpoint_day)) return false;
+    restore(snapshot);
+    daily_.observeDay(snapshot.checkpoint_day);
+    daily_.restoreCountAndRaw(history_.count(snapshot.checkpoint_day), snapshot.raw_steps);
+    daily_.sample(live_raw);
+    rememberCurrentDay();
+    return true;
   }
 
   bool observeDay(int32_t day) {
@@ -26,6 +49,7 @@ class StepTracking {
       history_ = StepHistory();
     daily_.observeDay(day);
     daily_.restoreCount(history_.count(day));
+    anchor_required_ = true;
     rememberCurrentDay();
     return true;
   }
@@ -47,8 +71,16 @@ class StepTracking {
   bool hasDay() const { return daily_.hasDay(); }
   int32_t dayKey() const { return daily_.dayKey(); }
   bool needsBaseline() const { return daily_.needsBaseline(); }
+  bool needsAnchorSave() const {
+    return anchor_required_ && hasDay() && !needsBaseline();
+  }
   const StepHistory& history() const { return history_; }
-  bool dirty() const { return history_ != saved_history_; }
+  bool dirty() const {
+    if (history_ != saved_history_ || anchor_required_) return true;
+    if (!hasDay()) return false;
+    const bool has_raw = !needsBaseline();
+    return has_raw != saved_has_raw_ || (has_raw && daily_.lastRaw() != saved_raw_);
+  }
 
   template <typename Store>
   bool save(Store& store, uint32_t second_of_day) {
@@ -58,8 +90,13 @@ class StepTracking {
     snapshot.history = history_;
     snapshot.checkpoint_day = dayKey();
     snapshot.checkpoint_second = second_of_day;
+    snapshot.has_raw_steps = !needsBaseline();
+    if (snapshot.has_raw_steps) snapshot.raw_steps = daily_.lastRaw();
     if (!saveStepHistory(store, snapshot)) return false;
     saved_history_ = history_;
+    saved_raw_ = snapshot.raw_steps;
+    saved_has_raw_ = snapshot.has_raw_steps;
+    if (snapshot.has_raw_steps) anchor_required_ = false;
     return true;
   }
 
@@ -71,6 +108,9 @@ class StepTracking {
   DailySteps daily_;
   StepHistory history_;
   StepHistory saved_history_;
+  uint16_t saved_raw_ = 0;
+  bool saved_has_raw_ = false;
+  bool anchor_required_ = false;
 };
 
 }  // namespace watch

@@ -86,10 +86,13 @@ walking heuristic, not measured GPS distance. The [NXP pedometer reference](http
 uses the male height coefficient 0.415 within a larger algorithm; this app uses
 the simple height-based estimate only. A measured walk can calibrate it later.
 Distance follows the [daily step counter](daily-steps.md): both reset at midnight
-on the watch's calendar and restore from the last flash checkpoint after reboot.
-The firmware checkpoints changed totals every 30 minutes and retains today plus
+on the watch's calendar. A verified warm reboot reads the still-running IMU
+before flash restoration and recovers unsaved activity using the saved raw
+reference. Sensor power loss/unverified continuity falls back to the saved
+total and a fresh baseline. The firmware checkpoints changed totals every
+30 minutes, commits each new sensor/day anchor once, and retains today plus
 14 previous dates. The 32-bit daily total accounts for the raw sensor's 16-bit
-rollover.
+rollover; recovery requires fewer than 65,536 steps since its persisted anchor.
 The profile constants are near `active_watchface` in `src/main.cpp`.
 
 ## Analog hand antialiasing

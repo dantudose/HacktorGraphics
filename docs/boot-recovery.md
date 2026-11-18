@@ -39,3 +39,28 @@ supply stays on. Startup now restores `FUNC_CFG_ACCESS=0` before reading its
 identity. The observed `0x10` identity was the default value of bank A's
 pedometer-threshold register at the same address, rather than the normal
 `WHO_AM_I=0x6a`; see the [LSM6DSL register map](https://www.st.com/resource/en/datasheet/lsm6dsl.pdf).
+
+Startup keeps touch in reset and checks the IMU before loading step history.
+It verifies 13 expected control/interrupt registers and reads the raw step
+counter. If the running configuration and committed-anchor marker are valid,
+it skips `SW_RESET` and reconfiguration, loads the saved daily/raw reference,
+and adds the live counter delta. A normal warm reset can therefore recover
+steps that have not reached a 30-minute flash checkpoint, without forcing a
+new history write.
+
+Cold or unverified sensors retain the known-good reset/setup sequence. Startup
+restores the saved daily count, takes a fresh raw baseline, and saves the new
+anchor once after boot time synchronization has had a chance to set the date.
+Legacy 144-byte version-1 history loads but has no raw anchor; it is upgraded
+to a 148-byte version-2 snapshot under the same NVS key at that baseline save.
+Unsaved pre-upgrade activity and unsaved activity lost with sensor power cannot
+be recovered from the old counter reference.
+
+The firmware uses `CTRL3_C.BDU` as a committed-anchor gate: `0x04` remains in
+place during cold/day-baseline changes, and only a successful flash commit
+permits `0x44`, which warm startup requires. This prevents an interrupted setup
+from pairing an old flash reference with a new sensor/day baseline. BDU changes
+unused accelerometer/gyro output-byte latching; step counting stays enabled.
+This relies on the current no-FIFO configuration. See
+[ST AN5040, sections 4.4, 5.7 and 6.1](https://www.st.com/resource/en/application_note/dm00402563.pdf)
+and [daily-step recovery and validation](daily-steps.md).

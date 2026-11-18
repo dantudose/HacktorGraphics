@@ -6,7 +6,8 @@ hardware counter. A successful midnight snapshot adds the last unsampled steps
 to the outgoing date, including steps taken while the display was asleep, then
 becomes the new date's baseline. The daily total uses 32 bits and handles the
 hardware counter's 16-bit rollover when fewer than 65,536 steps pass between
-samples.
+samples. Warm-reset recovery also requires fewer than 65,536 steps since the
+persisted raw-counter anchor; prolonged save failures can exceed that limit.
 
 ## History and flash checkpoints
 
@@ -28,20 +29,32 @@ or a normal visible wake; reading BLE itself does not refresh the sensor.
 
 `StepCheckpoint` schedules a sensor snapshot every **30 minutes**, both awake
 and asleep. After sampling, firmware writes only if the dated totals or history
-have changed since the last successful save. Unchanged totals on the same date
-do not write, even just to refresh a timestamp. The first checkpoint is a full
-30 minutes after boot. Success, failure, and an unchanged snapshot all start a
-new 30-minute interval; delayed service does not trigger catch-up writes.
-Midnight finalizes history in RAM and waits for the next checkpoint to persist
-it. Clock edits and baseline retries also cannot bypass that interval. Step
-history therefore attempts at most 48 flash saves per day, often fewer.
+or their raw-counter reference have changed since the last successful save.
+Unchanged values do not write just to refresh a timestamp. The normal deadline
+starts 30 minutes after boot; save attempts and unchanged periodic checks start
+a new 30-minute interval. Delayed service does not trigger catch-up writes.
 
-The entire snapshot is one **144-byte**, versioned, little-endian blob with
-CRC-32, stored under `steps-v1` in the existing `watch` NVS namespace. This uses
+A new sensor/day baseline needs a durable raw reference before it can support
+warm-reset recovery. Cold setup, legacy migration, midnight, and other date
+changes therefore save that anchor once, without waiting for the normal
+interval. The initial anchor is saved before the potentially blocking boot CTS
+attempt; a CTS date correction then saves its own dated anchor if needed.
+Pending anchor failures retain their RAM state and retry at
+most once per minute; ordinary periodic save failures wait for the next
+30-minute checkpoint. There are at most 48 ordinary periodic attempts per day,
+plus these baseline-anchor saves and their bounded retries. A verified warm
+reset on the same date does not force another step-history write.
+
+The entire snapshot is one **148-byte version-2**, little-endian blob with
+CRC-32, stored under the retained `steps-v1` key in the existing `watch` NVS
+namespace. It contains the dated 32-bit totals, checkpoint clock time, and a
+16-bit raw-counter anchor with a validity flag. This uses
 the ESP32's main flash, independently of the external NOR chip on the switched
 peripheral rail. Loading never writes. Missing, truncated, unsupported, or
 invalid snapshots are rejected without partially restoring their contents.
-Failed saves retain the RAM changes for the next 30-minute checkpoint.
+Legacy 144-byte version-1 snapshots still load, but have no raw reference; the
+first upgraded boot establishes and saves one. Unsaved activity from before
+that upgrade cannot be reconstructed from a version-1 record.
 
 NVS appends replacement values to its log and reclaims pages, distributing
 flash use; a checkpoint does not imply a sector erase. Espressif documents
@@ -50,18 +63,52 @@ CRC checks the application snapshot as well. These mechanisms do not guarantee
 a particular flash lifetime or preserve unsaved RAM data. See
 [Espressif's NVS storage and robustness documentation](https://docs.espressif.com/projects/esp-idf/en/v5.1.4/esp32s3/api-reference/storage/nvs_flash.html).
 
-An abrupt reset normally risks the most recent **30 minutes** of steps and
-distance. Failed sensor reads, failed writes, or delayed service can extend
-that window. On boot, firmware restores the saved date's daily total and takes
-a fresh sensor baseline after IMU initialization. It never reuses a raw sensor
-value from before reset, which avoids treating an IMU reset as a large rollover.
+## Recovery after reset
+
+On a CPU/USB reset, the IMU can remain powered and keep counting. Startup probes
+it **before loading step history from flash**: it restores the user register
+bank, checks identity and 13 expected configuration registers, and takes a
+coherent raw-counter snapshot. If the running configuration and committed-anchor
+marker are valid, startup keeps the sensor running instead of issuing
+`SW_RESET` or reconfiguring the pedometer. It then restores the saved daily
+total and adds `uint16_t(live_raw - saved_raw)`, including unsampled activity
+since the last save. This also works before the first normal 30-minute
+checkpoint, once the initial raw anchor has been committed.
+
+The live 16-bit value is a free-running counter, not a dated daily total. Its
+saved association with the 32-bit total prevents double-counting and handles
+one counter rollover. ST documents the counter and its retention through
+accelerometer power-down/pedometer disable in
+[AN5040, sections 5.7 and 6.1](https://www.st.com/resource/en/application_note/dm00402563.pdf).
+Recovery does not rely on an assumption that an IMU software reset preserves
+that counter: a verified warm startup avoids the reset entirely.
+
+After sensor power loss or an unverified configuration/read, firmware follows
+the existing cold reset/setup path, restores only the saved daily total, takes
+a fresh raw baseline, and commits a new anchor once. That fallback can lose
+the last **30 minutes** of unsaved activity; sensor/save failures or delayed
+service can extend the loss window. A missing or invalid history has no safe
+daily reference for the live raw counter and starts a new record.
+
+To prevent a reset during setup from combining an old flash reference with a
+new sensor/day baseline, firmware leaves `CTRL3_C=0x04` until that anchor is
+durable. Only a successful save permits `0x44`, which the warm probe requires.
+The changed bit is BDU, which controls unused accelerometer/gyro output-byte
+latching; pedometer counting stays enabled and the step reader checks byte
+coherence in software. Date-baseline changes clear and verify this marker
+before changing their reference. This scheme relies on the current no-FIFO
+configuration: FIFO use would require BDU enabled. See
+[AN5040, section 4.4 and the FIFO requirements](https://www.st.com/resource/en/application_note/dm00402563.pdf).
 
 The persisted checkpoint date/time also supplies the boot clock fallback when
 valid, preventing the firmware build date from replacing the saved activity
 date. Without a valid snapshot, the compile-time fallback is used. There is no
 persistent RTC to measure elapsed time across reset or power loss; CTS or manual
 time setting must correct that fallback. A stationary watch can retain an old
-checkpoint time because unchanged totals do not justify a flash write.
+checkpoint time because unchanged totals do not justify a flash write. Live
+counter recovery alone cannot identify which side of an unobserved midnight
+steps belong to; exact assignment while the processor was unavailable remains
+limited by that clock fallback.
 
 Same-date clock corrections preserve the total. Selecting another retained
 date restores its count and establishes a fresh sensor baseline; a date with no
@@ -122,23 +169,26 @@ c++ -std=c++11 -Wall -Wextra -Werror -I include test/test_step_checkpoint.cpp -o
 /tmp/hacktor-step-checkpoint-tests
 c++ -std=c++11 -Wall -Wextra -Werror -I include test/test_step_tracking.cpp -o /tmp/hacktor-step-tracking-tests
 /tmp/hacktor-step-tracking-tests
+c++ -std=c++11 -Wall -Wextra -Werror -I include test/test_lsm6dsl_startup.cpp -o /tmp/hacktor-lsm6dsl-startup-tests
+/tmp/hacktor-lsm6dsl-startup-tests
 c++ -std=c++11 -Wall -Wextra -Werror -I test/step_stubs -I include test/test_step_counter_read.cpp -o /tmp/hacktor-step-counter-read-tests
 /tmp/hacktor-step-counter-read-tests
 pio run -e hacktor_watch_s3_lgfx
 ```
 
-Host tests cover dated retention, reset restoration with a fresh sensor
-baseline, rollover/wrap, malformed and corrupted blobs, failed writes, unchanged
-save suppression, 30-minute scheduling and millisecond rollover. They do not
-measure hardware power or emulate NVS power interruption.
+Host tests cover dated retention, warm recovery from a saved raw anchor,
+cold/legacy restoration, rollover/wrap, malformed and corrupted blobs, failed
+writes, unchanged save suppression, startup configuration validation,
+30-minute scheduling and millisecond rollover. They do not measure hardware
+power or emulate NVS power interruption.
 
 On the watch:
 
-1. Walk, let a checkpoint pass, record the steps/distance, then reset. Verify
-   that the saved count returns on Analog, Digital, and status and that walking
-   afterward adds normally. Reset before the next checkpoint to verify that
-   only the unsaved portion is lost. Reset several times before 30 minutes;
-   history must not write at each boot.
+1. After the initial anchor save, walk and reset the CPU before 30 minutes.
+   Verify unsaved steps/distance return on Analog, Digital, status, and BLE,
+   then keep increasing normally. Repeat several warm resets on the same
+   date; they must not cause extra step-history saves. Repeat after a normal
+   checkpoint and near the raw counter's rollover.
 2. Repeat on battery with wrist wake off, walking while the screen is asleep
    through a checkpoint. Check for potential brief rail glow, preserved face
    and sleep state, and restored asleep steps after reset. Leave it stationary
@@ -147,7 +197,8 @@ On the watch:
 3. Set the clock shortly before midnight using CTS or Settings. Verify zero
    steps/distance at rollover, outgoing steps retained in history, and new
    increments afterward. Repeat asleep and with an active timer alert. Reset
-   after the next checkpoint and verify both dates survive.
+   after the new baseline anchor is saved and verify both dates survive,
+   without waiting for a 30-minute checkpoint.
 4. Exercise same-date time corrections, another retained date, an unrecorded
    date, and a correction more than 14 days backward. Inspect the saved history
    to confirm date uniqueness and that the retained 15-calendar-date window
@@ -156,3 +207,8 @@ On the watch:
    resynchronize. Check failed reads and saves retain known counts and retry
    without a tight loop. Test a truncated/corrupted blob in a controlled setup;
    boot should reject it and start with the normal compile-time fallback.
+6. Remove sensor power and reboot to verify saved-total fallback with a fresh
+   raw baseline. Test a version-1 history upgrade. In a controlled failure
+   setup, interrupt or fail the new anchor save: `CTRL3_C` must remain `0x04`,
+   and reboot must not add a stale raw-counter delta. Confirm pending anchor
+   retries are at most once per minute and successful commit permits `0x44`.
